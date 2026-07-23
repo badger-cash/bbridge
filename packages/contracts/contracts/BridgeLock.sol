@@ -194,6 +194,7 @@ contract BridgeLock {
     error InvalidStampSignature();
     error HeaderBelowDifficultyFloor();
     error InvalidMerkleProof();
+    error ZeroAuthorizer();
 
     constructor(
         IERC20 token_,
@@ -205,6 +206,14 @@ contract BridgeLock {
         bytes8 xecNetworkId_,
         uint256 minDifficultyTarget_
     ) {
+        // No zero-address check exists anywhere else in this contract for `authorizer`
+        // after construction (it's immutable, invariant 4) -- if it were ever left at
+        // address(0), confirmDeposit()'s sole trust gate would become trivially
+        // bypassable, since ecrecover returns address(0) (not a revert) for malformed
+        // signature parameters such as v not in {27,28}. Caught here once, permanently,
+        // rather than left as an unrecoverable deployment mistake (audit finding #3).
+        if (authorizer_ == address(0)) revert ZeroAuthorizer();
+
         token = token_;
         tokenDecimals = tokenDecimals_;
         authorizer = authorizer_;
@@ -247,9 +256,23 @@ contract BridgeLock {
 
     /// @notice Lock `amount` of `token`, to be released on XEC to `xecRecipient`.
     /// Caller must have approved this contract for at least `amount` beforehand.
+    ///
+    /// Accounting is based on this contract's own measured `token` balance delta, not
+    /// the caller-supplied `amount` (audit finding #5): for a fee-on-transfer or
+    /// otherwise non-standard ERC-20, `amount` and what this contract actually
+    /// receives can differ. Trusting `amount` would let a depositor lock less than
+    /// `amount` while `netAmount` still recorded the full nominal figure, then
+    /// `refund()` the (unreceived) difference out of the shared pool at other
+    /// depositors' expense. Measuring the real delta means `netAmount` can never
+    /// exceed what this deposit actually contributed, so there is nothing left to
+    /// extract this way regardless of `token`'s transfer semantics.
     function deposit(uint256 amount, bytes20 xecRecipient) external returns (bytes32 depositId) {
-        if (amount <= feeAmount) revert AmountTooSmall();
-        uint256 net = amount - feeAmount;
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = token.balanceOf(address(this)) - balanceBefore;
+
+        if (received <= feeAmount) revert AmountTooSmall();
+        uint256 net = received - feeAmount;
         if (net > type(uint96).max) revert AmountTooLarge();
         uint96 netAmount = uint96(net);
 
@@ -264,14 +287,16 @@ contract BridgeLock {
             refunded: false
         });
 
-        token.safeTransferFrom(msg.sender, address(this), amount);
-
         emit DepositLocked(depositId, msg.sender, netAmount, xecRecipient);
     }
 
     /// @notice Reclaim a deposit's full original locked amount. Only the original
     /// depositor's own key can do this, and only before it's been confirmed --
     /// confirmation closes this path permanently (invariant 3, `overview.md` `5.`).
+    /// @dev `d.netAmount` is now always backed by what deposit() actually measured
+    /// itself receiving (audit finding #5, see deposit()'s own doc comment) -- so
+    /// `fullAmount` below can never exceed what this specific deposit contributed to
+    /// the contract's balance, regardless of `token`'s transfer semantics.
     function refund(bytes32 depositId) external {
         Deposit storage d = deposits[depositId];
         if (d.depositor == address(0)) revert UnknownDeposit();
