@@ -1,0 +1,23 @@
+{
+  "name": "@bbridge/sdk",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Reference TypeScript client for the eCash (XEC) <-> Ethereum bridge",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test"
+  },
+  "dependencies": {
+    "@hansekontor/checkout-components": "1.1.0",
+    "bsert": "^0.0.13",
+    "bufio": "^1.2.1",
+    "n64": "^0.2.10"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.130",
+    "typescript": "^7.0.2"
+  }
+}

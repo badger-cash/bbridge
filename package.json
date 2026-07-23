@@ -1,0 +1,10 @@
+{
+  "name": "bbridge",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Specifications and reference implementation for the eCash (XEC) <-> Ethereum bridge",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ]
+}
