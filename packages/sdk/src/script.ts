@@ -49,7 +49,11 @@ export function buildOutOracle(amount: number, recipientPubkey: Buffer): Buffer 
 
   assert(Number.isInteger(amount), 'amount must be an integer')
   assert(amount > 0, 'amount must be greater than 0')
-  bw.writeBytes(U64.fromInt(amount).toBE(Buffer))
+  // U64.fromInt truncates values above 32 bits (silently drops the high word) --
+  // real SLP quantities routinely exceed that, so this needs the full-range
+  // fromString, not fromInt (found while wiring packages/contracts' end-to-end
+  // lifecycle test with a realistic, >32-bit XEC-side amount).
+  bw.writeBytes(U64.fromString(String(amount)).toBE(Buffer))
 
   assert(Buffer.isBuffer(recipientPubkey), 'recipientPubKey must be a Buffer')
   const uncompressedPubkey = secp256k1.publicKeyConvert(recipientPubkey, false)
@@ -111,7 +115,9 @@ export function buildMintOpReturnV2(tokenId: Buffer, mintQuantityArr: number[]):
     .pushData(tokenId)
 
   for (let i = 0; i < mintQuantityArr.length; i++) {
-    mintOpReturn.pushData(U64.fromInt(mintQuantityArr[i]).toBE(Buffer))
+    // fromString, not fromInt -- see buildOutOracle's note above; real mint
+    // quantities routinely exceed 32 bits.
+    mintOpReturn.pushData(U64.fromString(String(mintQuantityArr[i])).toBE(Buffer))
   }
 
   mintOpReturn.compile()
@@ -141,7 +147,7 @@ export function buildGenesisOpReturnV2(
     .pushData(tokenDocHash)
     .pushPush(Buffer.alloc(1, decimals))
     .pushData(mintVaultScripthash)
-    .pushData(U64.fromInt(genesisQuantity).toBE(Buffer))
+    .pushData(U64.fromString(String(genesisQuantity)).toBE(Buffer)) // fromString, not fromInt -- see buildOutOracle's note above
     .compile()
   return genesisOpReturn
 }

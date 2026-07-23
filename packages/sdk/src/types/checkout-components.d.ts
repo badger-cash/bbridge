@@ -198,6 +198,8 @@ declare module 'n64' {
   }
   export class U64 {
     static fromInt(n: number): U64
+    /** Unlike fromInt (which truncates values above 32 bits -- silently drops the high word), fromString parses the full 64-bit value from a decimal string. Use this for real SLP quantities, which routinely exceed 32 bits. */
+    static fromString(s: string): U64
     toBE(ctor: BufferConstructor): Buffer
     toLE(ctor: BufferConstructor): Buffer
   }

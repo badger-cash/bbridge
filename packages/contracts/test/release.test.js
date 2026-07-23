@@ -2,83 +2,17 @@ const { expect } = require('chai')
 const { ethers } = require('hardhat')
 const crypto = require('crypto')
 const { buildGenesis } = require('./helpers/genesis')
+const { sdkRoot, signInput, p2pkhScript, u64be, bitsToTarget, mineSingleTxHeader, EASY_BITS } = require('./helpers/ecash')
 
-// packages/contracts doesn't depend on @hansekontor/checkout-components or
-// @bbridge/sdk directly -- it's hoisted/nested under packages/sdk's own
-// node_modules, so we reach it explicitly, the same way the scratch scripts
-// used to validate packages/sdk's merkle module against a real block did.
-const sdkRoot = require('path').resolve(__dirname, '../../sdk')
-const { KeyRing, Script, Coin } = require(sdkRoot + '/node_modules/@hansekontor/checkout-components')
+const { KeyRing, Script, Coin, bcrypto } = require(sdkRoot + '/node_modules/@hansekontor/checkout-components')
 const { PreimageMTX } = require(sdkRoot + '/dist/src/preimage')
-const { bcrypto } = require(sdkRoot + '/node_modules/@hansekontor/checkout-components')
-const { Hash256, Hash160, secp256k1 } = bcrypto
-const bufio = require('bufio')
-
-// tx.signature(...) defaults to Schnorr in this library (64 bytes, not DER) --
-// classic ECDSA DER is what standard P2PKH/OP_CHECKSIG and this contract's
-// EcashTx.parseDER both expect, so sign the same low-level way lib/oracle.js
-// does throughout this whole system (signatureHash + secp256k1.signDER,
-// sighashtype byte appended manually), not via the higher-level wrapper.
-function signInput(tx, index, scriptCode, value, key, sighashType, flags) {
-  const hash = tx.signatureHash(index, scriptCode, value, sighashType, flags)
-  const der = secp256k1.signDER(hash, key)
-  const bw = bufio.write(der.length + 1)
-  bw.writeBytes(der)
-  bw.writeU8(sighashType)
-  return bw.render()
-}
-
-function p2pkhScript(pubkeyHash) {
-  return new Script().pushSym('dup').pushSym('hash160').pushData(pubkeyHash).pushSym('equalverify').pushSym('checksig').compile()
-}
-
-function u64be(n) {
-  const buf = Buffer.alloc(8)
-  buf.writeBigUInt64BE(n)
-  return buf
-}
-
-function bitsToTarget(bits) {
-  const exponent = bits >>> 24
-  const mantissa = bits & 0x007fffff
-  let target = BigInt(mantissa)
-  if (exponent <= 3) target >>= BigInt(8 * (3 - exponent))
-  else target <<= BigInt(8 * (exponent - 3))
-  return target
-}
-
-function hashToUint(buf) {
-  let n = 0n
-  for (let i = 31; i >= 0; i--) n = (n << 8n) | BigInt(buf[i])
-  return n
-}
-
-const EASY_BITS = 0x1f00ffff
-
-function mineSingleTxHeader(merkleRoot) {
-  const target = bitsToTarget(EASY_BITS)
-  let nonce = 0
-  for (;;) {
-    const header = Buffer.alloc(80)
-    header.writeUInt32LE(1, 0)
-    crypto.randomBytes(32).copy(header, 4)
-    merkleRoot.copy(header, 36)
-    header.writeUInt32LE(Math.floor(Date.now() / 1000), 68)
-    header.writeUInt32LE(EASY_BITS, 72)
-    header.writeUInt32LE(nonce, 76)
-
-    const hash = Hash256.digest(header)
-    if (hashToUint(hash) <= target) return header
-    nonce++
-    if (nonce > 2_000_000) throw new Error('failed to mine a header within budget')
-  }
-}
+const { Hash160 } = bcrypto
 
 /// Builds and signs a two-input postage-style burn transaction matching what
 /// BridgeLock.release() expects (overview.md `6.`), using the underlying eCash
 /// primitives directly since packages/sdk doesn't have a burn/postage builder
 /// yet (overview.md `9.`, "No burn/postage transaction builder exists yet").
-function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQuantity }) {
+function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQuantity, stampSighashType }) {
   const burner = KeyRing.fromPrivate(crypto.randomBytes(32), true)
   const authorizer = KeyRing.fromPrivate(Buffer.from(authorizerPrivateKey.replace(/^0x/, ''), 'hex'), true)
 
@@ -118,7 +52,13 @@ function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQ
   tx.inputs[0].script.fromItems([burnSig, burnerPubkey])
 
   tx.template(authorizer)
-  const stampSig = signInput(tx, 1, authorizerScript, stampCoin.value, authorizer.privateKey, SIGHASH_ALL | SIGHASH_FORKID, flags)
+  // release() requires the stamp input's own sighashtype byte to be exactly
+  // ALL|FORKID, no ANYONECANPAY (BridgeLock._verifyStampInput) -- without
+  // ANYONECANPAY, hashPrevouts covers every input's outpoint, not just the stamp's
+  // own, so this signature binds *which* burner coin (input 0) it is co-signing.
+  // stampSighashType defaults to that required value; overridable so a test can
+  // prove ANYONECANPAY is actually rejected, not just assumed to be.
+  const stampSig = signInput(tx, 1, authorizerScript, stampCoin.value, authorizer.privateKey, stampSighashType ?? (SIGHASH_ALL | SIGHASH_FORKID), flags)
   tx.inputs[1].script.fromItems([stampSig, authorizerPubkey])
 
   tx.check(flags) // real eCash script verification, same as packages/sdk's own tests
@@ -225,6 +165,32 @@ describe('BridgeLock.release()', function () {
       bridgeAddress: bridge.address,
       tokenId,
       burnQuantity
+    })
+    const header = mineSingleTxHeader(txid)
+
+    await expect(
+      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+    ).to.be.revertedWithCustomError(bridge, 'InvalidStampSignature')
+  })
+
+  it('rejects a stamp input signed with ANYONECANPAY, even by the real Authorizer key', async function () {
+    // Without ANYONECANPAY, the stamp signature's hashPrevouts commits to every
+    // input's outpoint, including input 0's (the burner's coin) -- that's what
+    // actually binds the postage co-signature to *this* burn rather than any burn
+    // sharing the same stamp coin. A signature that used ANYONECANPAY would only
+    // commit to its own input, so it could be detached and reused to co-sign a
+    // postage-identical burn of a *different* coin. release() must reject it
+    // outright, not just from a signature-mismatch, but because it never accepts
+    // any sighashtype but ALL|FORKID for this input in the first place.
+    const SIGHASH_ALL = 0x01
+    const SIGHASH_FORKID = 0x40
+    const SIGHASH_ANYONECANPAY = 0x80
+    const { rawTx, txid, stampValue } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity,
+      stampSighashType: SIGHASH_ALL | SIGHASH_FORKID | SIGHASH_ANYONECANPAY
     })
     const header = mineSingleTxHeader(txid)
 

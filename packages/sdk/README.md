@@ -4,7 +4,7 @@ Reference TypeScript implementation of the eCash-side transaction logic for the 
 
 ## Status
 
-Functional and tested: `npm test` compiles and runs 26 passing cases, exercising real script execution via `@hansekontor/checkout-components`'s interpreter rather than mocks. Covers eCash-side primitives only — attestation construction/parsing, the self-mint covenant, genesis/mint transaction construction, and Merkle proof construction. Does not include chain connectivity, an Ethereum-side client, or an authorizer service; see [`docs/SPEC.md`](../../docs/SPEC.md) §4 for the full component map.
+Functional and tested: `npm test` compiles and runs 34 passing cases. Covers eCash-side primitives only — attestation construction/parsing, both self-mint covenant versions (the legacy `mintOutscript` and the current `mintCovenantV2`), genesis/mint transaction construction, and Merkle proof construction. `mintCovenantV2` is exercised via a small, opcode-faithful interpreter (`src/covenantInterpreter.ts`) rather than a real eCash script VM, since none is available in this repo — see that module's own doc comment for how it stays honest against the real interpreter's opcode semantics. It's also cross-tested against a real, deployed `BridgeLock.sol` in `packages/contracts`' `test/e2e.lifecycle.test.js` — the same authorizer signature bytes that contract's `confirmDeposit()` verifies via `ecrecover` are fed, re-encoded to DER, into a real `mintCovenantV2` execution. Does not include chain connectivity, an Ethereum-side client, or an authorizer service; see [`docs/SPEC.md`](../../docs/SPEC.md) §4 for the full component map.
 
 ## Installation
 
@@ -80,8 +80,24 @@ A host application may hold any number of `BridgeAssetConfig` values concurrentl
 | `buildInOpReturn` / `buildOutOpReturn` | `(...) => Script` | Wraps an attestation payload in the CTRL protocol OP_RETURN |
 | `buildMintOpReturnV2` | `(tokenId: Buffer, mintQuantityArr: number[]) => Script` | SLP Type 2 `MINT` OP_RETURN |
 | `buildGenesisOpReturnV2` | `(tokenTicker, tokenName, tokenUrl, tokenDocHash, decimals, genesisQuantity, mintVaultScripthash) => Script` | SLP Type 2 `GENESIS` OP_RETURN |
-| `mintOutscript` | `(prevoutValue: number, authPublicKey: Buffer) => Script` | The self-mint covenant redeem script |
+| `mintOutscript` | `(prevoutValue: number, authPublicKey: Buffer) => Script` | The legacy self-mint covenant redeem script — verifies the Authorizer's signature by deconstructing an entire prior, separately-broadcast oracle "in" attestation transaction. Superseded by `mintCovenantV2` below; kept, unremoved, alongside it. |
 | `buildPreImage` | `(rawTx: Buffer, keyring: KeyRing, prevoutValue: number) => PreImageResult` | Reference (non-consensus) JS simulation of `mintOutscript`'s stack machine, for documentation/debugging — not used by any other function here |
+| `CovenantOp` | `type` | `{ op: 'sym', sym: string } \| { op: 'int', value: number } \| { op: 'data', data: Buffer }` — one step of `mintCovenantV2Ops`'s opcode sequence, kept separate from the compiled `Script` so the exact same sequence can also be run by `covenantInterpreter.ts`'s plain-JS interpreter |
+| `mintCovenantV2Ops` | `(authPublicKey: Buffer) => CovenantOp[]` | The current self-mint covenant's opcode sequence, verifying a single, compact, Ethereum-produced authorization message directly (`docs/SPEC.md` §III.6) — no prior oracle attestation transaction involved, unlike `mintOutscript`. Single, flat Authorizer key; the SLP self-mint protocol's optional Merkle-proof key-rotation extension is deliberately not implemented (`docs/SPEC.md` Appendix A). |
+| `mintCovenantV2` | `(authPublicKey: Buffer) => Script` | Compiles `mintCovenantV2Ops` into the actual redeem script |
+| `buildMintV2TxOutputs` | `(tokenId: Buffer, xecAmount: number, xecRecipientHash160: Buffer) => Buffer` | The fully serialized expected mint outputs (`MINT` OP_RETURN + recipient P2PKH), exactly matching `BridgeLock.sol`'s `_buildMintTxOutputs` |
+| `buildAuthorizationMessage` | `(depositId, utxoTxid, utxoIndex, tokenId, xecAmount, xecRecipientHash160) => Buffer` | The exact message `BridgeLock.sol`'s `_authorizationDigest` signs — `depositId \|\| utxoTxid \|\| utxoIndex \|\| txOutputs` |
+
+### `covenantInterpreter`
+
+There is no real eCash script VM available in this repo to execute a compiled covenant `Script`'s bytecode against. This module is what stands in for one: a small interpreter covering exactly the opcodes `mintCovenantV2Ops` uses, built from that *same* `CovenantOp[]` array the real `Script` is compiled from — not a hand-duplicated copy — so the two can't silently drift apart. Executed against real cryptographic primitives and a real, `PreimageMTX`-constructed transaction's own preimage/sighash, not a structural mock; verified against the actual opcode implementations in `@hansekontor/checkout-components`'s own interpreter source, not just inferred. Shared between this package's own covenant tests (`test/mintCovenantV2.test.ts`) and `packages/contracts`' cross-chain end-to-end test.
+
+| Export | Signature | Description |
+|---|---|---|
+| `runCovenant` | `(ops: CovenantOp[], initialStack: Buffer[], ctx: CovenantCtx) => boolean` | Executes an opcode sequence against an initial witness stack; `ctx.realSighash` is what the final `OP_CHECKSIG` compares against |
+| `signDER` | `(hash: Buffer, privateKey: Buffer) => Buffer` | Explicit ECDSA/DER signing — `tx.signature(...)`'s Schnorr-by-default (see Known limitations) makes this the safer default for anything that needs to cross to Ethereum or match `EcashTx.parseDER` |
+| `verifySignature` | `(hash: Buffer, sig: Buffer, key: Buffer) => boolean` | Dispatches on signature length (64 bytes → Schnorr, otherwise → DER/ECDSA), matching the real interpreter's own dispatch |
+| `sha256` / `hash256` | `(buf: Buffer) => Buffer` | Single/double SHA-256 |
 
 ### `preimage`
 
@@ -119,7 +135,9 @@ See `test/oracle.test.ts` for a complete worked genesis → attestation → mint
 ```
 src/
   constants.ts                     dust/covenant amounts, token metadata
-  script.ts                        OP_RETURN encoding, mintOutscript
+  script.ts                        OP_RETURN encoding, mintOutscript, mintCovenantV2
+  covenantInterpreter.ts           shared opcode interpreter for mintCovenantV2Ops, used by this
+                                    package's own tests and packages/contracts' e2e test
   preimage.ts                      PreimageMTX
   oracle.ts                        BridgeAssetConfig, attestation/mint/genesis builders
   merkle.ts                        buildMerkleProof, verifyMerkleProof
@@ -141,4 +159,10 @@ npm run build   # compile only
 - No confirmation-depth or reorg handling.
 - Oracle attestation content (`amountBase`, `recipientPubKey`, `transactionId`) is accepted as caller-supplied input rather than derived deterministically from source-chain state. Per `docs/SPEC.md` §III, the deterministic-derivation role belongs to the Ethereum Lock Contract (`packages/contracts`), not this package; this package's attestation builders remain useful for the eCash-side mint step regardless.
 - `buildGenesisTx` takes token metadata directly; nothing here deploys or looks up an SLP token automatically.
-- No burn or postage transaction builder yet (`docs/SPEC.md` §IV) — withdrawal transaction construction is not implemented in this package.
+- No first-class burn or postage transaction builder yet (`docs/SPEC.md` Appendix A) — the withdrawal-side transaction is built and proven correct in `packages/contracts`' own test suite (`test/release.test.js`, `test/e2e.lifecycle.test.js`), using this package's lower-level primitives directly, but isn't exposed as a dedicated function here the way `mintCovenantV2` exists for the deposit side.
+- Merkle-proof key rotation (the SLP self-mint protocol's optional Token Type 2 extension) is not implemented — `mintCovenantV2` uses a single, flat Authorizer key, matching `BridgeLock.sol`'s own single immutable `authorizer` address. Deferred to a future version that adds a matching rotation mechanism on both sides.
+
+## Gotchas
+
+- **`MTX.prototype.signature()` defaults to Schnorr (64-byte) signatures**, not the classic ECDSA DER that Ethereum-facing code and standard P2PKH `OP_CHECKSIG` need. Sign explicitly instead — `signatureHash` + `secp256k1.signDER`/`signRecoverableDER` (see `covenantInterpreter.ts`'s `signDER`, or `lib/oracle.js`'s existing pattern), with the sighash-type byte appended by hand.
+- **`n64`'s `U64.fromInt` silently truncates values above 32 bits** (drops the high word rather than throwing). Real SLP quantities routinely exceed that — `buildMintOpReturnV2`, `buildGenesisOpReturnV2`, and `buildOutOracle` all use `U64.fromString(String(amount))` internally for exactly this reason. Bear this in mind before reaching for `U64.fromInt` directly in any new code that encodes an amount.

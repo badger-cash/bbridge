@@ -2,8 +2,8 @@
 
 # bbridge Protocol Specification
 
-### Specification version: 0.1
-### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`, `packages/contracts`); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
+### Specification version: 0.2
+### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 34 passing cases; `packages/contracts`: 42 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
 
 # Table of Contents
 
@@ -95,7 +95,16 @@ Type 2's MINT Vault model permits any UTXO held at the vault's P2SH address to a
 
 ## 1. Lock
 
-The user calls the Ethereum Lock Contract, locking a quantity of USDC or USDT and specifying the XEC recipient (the HASH160 of the recipient's XEC public key). The contract deducts its fixed fee and records the net amount, the recipient, and the depositor's address, keyed by a fresh `depositId`.
+The user calls the Ethereum Lock Contract, locking a quantity of USDC or USDT and specifying the XEC recipient (the HASH160 of the recipient's XEC public key). The contract deducts its fixed fee and records the net amount, the recipient, and the depositor's address, keyed by a fresh `depositId`. `netAmount` is recorded in `token`'s own decimals (`tokenDecimals`) at this point — no conversion to XEC-side units happens until confirmation (Section III.3).
+
+### Decimal scaling
+
+`token` and the wrapped XEC-side token are not required to share a decimals value. The Lock Contract derives both `tokenDecimals` (a constructor argument) and `xecDecimals` (parsed from the wrapped token's own GENESIS transaction, supplied to the constructor — see Section II) and computes, once at construction:
+
+- `xecHasMorePrecision = tokenDecimals < xecDecimals`
+- `scale = 10 ** |tokenDecimals - xecDecimals|`
+
+At confirmation (Section III.3), `netAmount` is converted to the XEC-side quantity actually signed and minted: multiplied by `scale` (exact) if XEC is the more precise side, or divided by `scale` if `token` is. Division leaves a remainder — worth less than one XEC-side base unit — that can never be minted; it is immediately reclassified as counted fee revenue (`collectedDust`), never left owed to anyone or refundable past that point. The inverse conversion happens on release (Section IV.3): a burn quantity already in XEC-side units is converted back to `token`'s own decimals, with any division-side remainder banked in a running accumulator (`pendingXecDust`) across releases and reclassified into `collectedDust` once it crosses a full `token`-side base unit. Neither remainder is ever deducted from any individual user's own deposit or release beyond that single transaction's own unavoidable fraction — dust is conserved, not confiscated from other users. When `tokenDecimals == xecDecimals`, `scale == 1` and neither leg ever loses anything.
 
 ## 2. Refund
 
@@ -105,23 +114,32 @@ Before confirmation (Section III.3), the depositor may reclaim the full original
 
 Once a deposit has aged past a fixed, contract-enforced confirmation-depth threshold, the Authorizer submits a confirmation call, supplying only:
 
-- a single-use reference (`utxoRef`), and
-- an ECDSA signature.
+- a single-use reference to a real eCash vault UTXO (`utxoTxid`, `utxoIndex` — a 36-byte outpoint, not an opaque value), and
+- an ECDSA signature (`v`, `r`, `s`).
 
-The contract computes the expected authorization content (Section III.4) from data it already recorded at Lock time plus `utxoRef`, and verifies the supplied signature against that computed content via `ecrecover`. The Authorizer's submission is otherwise unconstrained by nothing it can choose except `utxoRef` and the signature itself — it does not submit, and cannot alter, the recipient or amount. A second confirmation attempt for an already-confirmed or already-refunded deposit is rejected.
+The contract computes the expected authorization content (Section III.4) from data it already recorded at Lock time plus `utxoTxid`/`utxoIndex`, converts `netAmount` to XEC-side units (Section III.1's Decimal scaling), and verifies the supplied signature against that computed content via `ecrecover`. The Authorizer's submission is otherwise unconstrained by nothing it can choose except the outpoint and the signature itself — it does not submit, and cannot alter, the recipient or amount.
+
+A second confirmation attempt for an already-confirmed or already-refunded deposit is rejected. Additionally, the referenced vault outpoint itself is tracked (`utxoConsumedBy`) and may back at most one confirmation, ever, regardless of `depositId` — this closes a replay gap a per-deposit check alone would miss: without it, a previously-confirmed `(utxoTxid, utxoIndex, v, r, s)` tuple, publicly readable the moment it's first used (Section III.5), could otherwise be replayed to confirm a *second*, unrelated deposit that happens to share the same recipient and amount.
 
 ## 4. Authorization Content
 
-The signed message is:
+The signed message follows the [SLP self-mint protocol](https://github.com/badger-cash/slp-self-mint-protocol)'s Token Type 2 authorization format:
 
 ```
-message = xecRecipient (20 bytes) || netAmount (8 bytes, big-endian) || utxoRef (32 bytes)
+message = depositId (32 bytes)
+        || utxoTxid (32 bytes, internal byte order) || utxoIndex (4 bytes, little-endian)
+        || txOutputs
 digest  = SHA256(SHA256(message))
 ```
 
-`utxoRef` is bound into the signed message, not merely transmitted alongside the signature. A signature that did not bind `utxoRef` could be replayed to authorize a mint against any vault UTXO the minter selects, rather than only the one the Authorizer referenced — violating invariant 7.
+`txOutputs` is the *fully serialized* transaction output list the resulting mint transaction must produce — not just compact `(xecRecipient, amount)` fields: the SLP `MINT` OP_RETURN output for the wrapped token (Section V) followed by the network-dust-value P2PKH output paying `xecRecipient`, each encoded as the standard Bitcoin-family `value (8 bytes, little-endian) || scriptLen (1 byte) || script`. Every field is fixed-width for a given deployment, so `message` is always the same total length; the eCash-side covenant never has to parse a variable-length structure, only hash-compare bytes it doesn't itself construct.
 
-The Authorizer's signature is verified via Ethereum's `ecrecover` against `digest`. `digest`'s construction (double SHA-256) matches the hash a corresponding eCash-side `OP_CHECKDATASIGVERIFY` check evaluates against the same message.
+Both `utxoTxid`/`utxoIndex` (the vault outpoint, Section III.3) and `depositId` are bound into the signed message, not merely transmitted alongside the signature:
+
+- Without the outpoint bound in, the same signature could be replayed to authorize a mint against any vault UTXO the minter selects, rather than only the one the Authorizer referenced — violating invariant 7.
+- Without `depositId` bound in, a signature valid for one deposit could be replayed to confirm a *second*, unrelated deposit sharing the same recipient and amount (Section III.3) — this is why `depositId` is the first field, not carried separately. It plays no other role: the eCash-side covenant treats it as opaque, splitting it off and discarding it once the signature over it has been verified, since it exists purely as a permanent on-chain link back to `deposits(depositId)` on Ethereum, not as something the covenant itself checks against the real spend.
+
+The Authorizer's signature is verified via Ethereum's `ecrecover` against `digest`. `digest`'s construction (double SHA-256) matches the hash the eCash-side covenant's own `OP_CHECKDATASIGVERIFY` check evaluates against the same message (eCash's single-hash `OP_CHECKDATASIG` semantics, composed with the covenant's own extra `OP_SHA256` step, together produce a full double-SHA256).
 
 ## 5. Publication
 
@@ -129,7 +147,17 @@ The contract exposes confirmed authorization content — `{xecRecipient, netAmou
 
 ## 6. Mint
 
-Using published authorization content, any party constructs an XEC transaction spending the vault UTXO identified by `utxoRef` (Section II). The self-mint covenant verifies the Authorizer's signature against the supplied content, verifies the spending transaction's real outputs match that content, and verifies that the referenced UTXO is genuinely the one consumed. Only the constructing party's own key signs this transaction.
+Using published authorization content, any party constructs an XEC transaction spending the vault UTXO identified by `utxoTxid`/`utxoIndex` (Section II). The self-mint covenant (`mintCovenantV2`, `packages/sdk/src/script.ts`) is parameterized by a single, flat Authorizer public key baked into the covenant address at genesis time — not a Merkle-rotatable set of keys; key rotation is a deliberately deferred future version, since the Ethereum Lock Contract's own `ecrecover` check is likewise against one immutable `authorizer` address with no rotation mechanism of its own, so rotating only the eCash side would not, by itself, enable real rotation.
+
+Spending the covenant requires, as witness items: the minter's own signature and public key, the current spend's own BIP143 preimage (supplied directly by the minter, not reconstructed in script), the Authorizer's signature, and `message` (Section III.4) itself. The covenant:
+
+1. Verifies the Authorizer's signature against `message`, then splits `message` into `depositId` (discarded), the vault outpoint, and `txOutputs`.
+2. Verifies the minter's own signature over the supplied preimage.
+3. Extracts this spend's real outpoint from the preimage's fixed head offset and requires it to equal the signed outpoint — proving this spend actually consumes the vault UTXO the Authorizer named.
+4. Extracts this spend's real `hashOutputs` from the preimage's fixed trailer and requires it to double-SHA256-match the signed `txOutputs` — proving this spend's real outputs are exactly what was authorized, no more and no less (a vault self-replenishment change output is not supported by this version; see Appendix A).
+5. Performs a final, standard `OP_CHECKSIG` against the real, VM-computed sighash of the transaction actually being broadcast, reusing the *same* minter signature bytes already verified against the supplied preimage in step 2 — since one ECDSA signature cannot validly verify against two different messages, this proves the preimage supplied in step 2 genuinely describes the transaction being broadcast, not independently fabricated bytes.
+
+Only the constructing party's own key signs this transaction; the Authorizer never broadcasts anything to XEC; its signature and the content it covers come entirely from Ethereum.
 
 ---
 
@@ -189,6 +217,24 @@ Release requires both a valid Authorizer signature *and* a header clearing this 
 
 Standard Bitcoin-family layout: `version (4, LE) || prevBlock (32) || merkleRoot (32) || time (4, LE) || bits (4, LE) || nonce (4, LE)`.
 
+### Authorization message (Section III.4)
+
+```
+message = depositId (32) || utxoTxid (32) || utxoIndex (4, LE) || txOutputs
+```
+
+`txOutputs` is the standard Type 2 `MINT` OP_RETURN output, minting `xecAmount` of the wrapped token's `token_id`, followed by the network-dust-value P2PKH recipient output, each serialized as `value (8, LE) || scriptLen (1) || script`:
+
+| Push | Bytes | Content |
+|---|---|---|
+| 1 | 4 | Lokad ID, `'SLP\x00'` |
+| 2 | 1 | Token type, `0x02` |
+| 3 | 4 | Transaction type, `'MINT'` |
+| 4 | 32 | `token_id` (the wrapped token's own, `xecTokenId` below) |
+| 5 | 8 | Mint quantity, big-endian |
+
+`token_id` here is the Ethereum Lock Contract's own `xecTokenId` — the HASH256 of the raw GENESIS transaction bytes supplied at construction (Section II) — not a separately hand-typed value, so this field cannot independently drift from the token the contract was actually deployed against.
+
 ### BURN OP_RETURN
 
 A bridge-specific variant of the standard SLP Type 2 BURN format:
@@ -202,7 +248,7 @@ A bridge-specific variant of the standard SLP Type 2 BURN format:
 | 5 | 8 | Burn quantity, big-endian |
 | 6 | 32 | `assetId` |
 
-`token_id` (push 4) is parsed but not independently verified against a stored value. A transaction's OP_RETURN is a self-reported claim; establishing genuine SLP token identity requires tracing token lineage back to a valid GENESIS, which is infeasible to verify from a single transaction's bytes and which no consensus layer enforces. The Authorizer's decision to co-sign the postage input (Section IV.2) is the operative attestation that a burn represents the correct wrapped token; the Ethereum Lock Contract relies on that signature rather than duplicating token-identity verification it cannot meaningfully perform.
+`token_id` (push 4) *is* verified against `xecTokenId` (`WrongTokenId` if it doesn't match) — but `xecTokenId` is not a separately hand-typed constant the way an earlier draft of this contract used. It is derived, once, at construction, as the HASH256 of the raw GENESIS transaction bytes the deployer supplies (Section II) — by SLP convention, a token's `token_id` *is* the HASH256 of its own GENESIS transaction, so this value cannot independently drift from the token actually deployed on XEC the way a hand-typed constant could. This is a narrower guarantee than full SLP validity: it does not trace token lineage back through the transaction graph the way a real indexer would, and it doesn't need to — the Authorizer's decision to co-sign the postage input (Section IV.2) remains the operative attestation that a burn represents the *correct* wrapped token in the presumably-indexed sense; this check only additionally rules out a mismatch against what this specific deployment was actually genesis'd with.
 
 `assetId` (push 6) *is* independently verified (Section IV.3.2), against the releasing contract's own address. This is a distinct kind of check from `token_id`: a trivial, self-referential domain separator requiring no external data or trust, present to scope a burn to the correct bridge deployment even under a fully honest Authorizer (for example, one Authorizer key backing multiple deployments).
 
@@ -217,10 +263,12 @@ Bitcoin-family algorithm (double SHA-256 parent hashing, duplicate-last-node han
 - **Non-custodial throughout.** No party but the user holds a key capable of moving the user's locked or wrapped funds, in either direction.
 - **No Authorizer discretion.** On deposit, the Authorizer cannot choose amount, recipient, or which deposit is authorized — only whether and when to confirm, subject to the fixed confirmation-depth threshold. On withdrawal, its only choice is whether to provide postage for a transaction whose content it neither constructs nor can alter.
 - **No double-authorization.** A deposit may be confirmed at most once (invariant 6).
-- **No double-redemption.** An authorization may be minted at most once (invariant 7): it is bound to one vault UTXO, spendable once.
+- **No double-redemption.** An authorization may be minted at most once (invariant 7): it is bound to one vault UTXO (Section III.4), spendable once — enforced primarily on the eCash side by consensus itself (a UTXO can only be spent once), and defense-in-depth on Ethereum too: `utxoConsumedBy` (Section III.3) additionally rejects a second confirmation against a vault outpoint already bound to a different `depositId`, so this invariant no longer rests solely on an assumption about eCash-side covenant behavior the Ethereum Lock Contract cannot itself verify.
+- **`depositId` binding.** A signature is scoped to the exact `depositId` it was produced for (Section III.4) — it can never validly authorize a different deposit, even one sharing an identical recipient and amount.
 - **Two-factor withdrawal release.** Release requires a valid Authorizer signature and an independently-clearing proof-of-work floor; neither is sufficient alone (Section IV.5).
 - **Independent verifiability.** Any party may recompute expected deposit authorization content from public data and verify the Authorizer's signature against it, without trusting an out-of-band claim about which deployment or asset is in play.
 - **No ongoing cooperation required for withdrawal.** Once the burn transaction of Section IV.1–2 is confirmed, completing a withdrawal requires only public XEC-chain data and requires no further action from the Authorizer or any specific party.
+- **Dust is conserved, not confiscated.** When `tokenDecimals` and `xecDecimals` differ (Section III.1), each individual deposit or release can leave behind a sub-base-unit remainder that cannot be minted or paid out. That remainder is reclassified as counted fee revenue for the deployment as a whole; it is never deducted from any *other* user's own deposit or release beyond that single transaction's own unavoidable fraction.
 
 ---
 
@@ -228,13 +276,14 @@ Bitcoin-family algorithm (double SHA-256 parent hashing, duplicate-last-node han
 
 The following parameters and formats are implemented with provisional values or are not yet fixed, and require a decision prior to production deployment:
 
-- **`utxoRef` shape and byte order.** Currently treated as an opaque 32-byte value by the Ethereum Lock Contract; its concrete structure must be settled jointly with the eCash-side self-mint covenant, which must independently compute the identical value.
-- **`minDifficultyTarget` value.** A deployment-time constant with no chosen real-world value.
+- **`minDifficultyTarget` value.** A deployment-time constant with no chosen real-world value; the test suite uses a maximally permissive placeholder deliberately, not a proposed real one.
 - **Fee destination.** Collected fees currently accumulate in the Lock Contract's own balance with no further routing logic.
 - **Deployment scope.** One Lock Contract per bridged asset is assumed throughout; a multi-asset contract is not specified.
 - **BURN OP_RETURN compatibility.** The layout in Section V has not been validated against third-party SLP indexing tooling.
-- **Gas cost of withdrawal processing.** Not yet measured against a target ceiling.
+- **Gas cost of withdrawal processing.** Not yet measured against a target ceiling; `BridgeLock.sol` needed `viaIR: true` to compile at all, a signal this code does enough work that a real measurement matters before relying on it.
 - **Authorizer service specification.** Not yet written; key management, deposit-watching, and postage-UTXO management are unspecified.
+- **Merkle-proof key rotation.** The [SLP self-mint protocol](https://github.com/badger-cash/slp-self-mint-protocol)'s Token Type 2 format includes an optional Merkle-proof extension permitting the Authorizer's eCash-side key to rotate independently of a single static public key. `mintCovenantV2` (Section III.6) deliberately does not implement it in this version, since the Ethereum Lock Contract's own `authorizer` is a single immutable address with no rotation mechanism — rotating only the eCash side would not, by itself, enable real key rotation. A future version intended to support rotation needs a matching mechanism on both sides.
+- **No first-class burn/postage transaction builder in `packages/sdk` yet.** The withdrawal-side transaction (Section IV.1–2) is constructed and proven correct against a deployed `BridgeLock.release()` in `packages/contracts`' own test suite (`test/release.test.js`, `test/e2e.lifecycle.test.js`), using eCash primitives directly — but `packages/sdk` does not yet export a dedicated function for building it, unlike the deposit-side mint transaction (`mintCovenantV2`, Section III.6).
 
 ---
 

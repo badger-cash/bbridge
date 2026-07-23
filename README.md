@@ -13,7 +13,7 @@ This repository is a reference, not a production deployment. Its purpose is to l
 
 ## Status
 
-Both reference implementations are functional and tested (`packages/sdk`: 26 passing cases; `packages/contracts`: 22 passing cases, including a full cryptographically-real withdrawal end to end). Neither is audited. Several deployment parameters and byte-level formats remain open — see `docs/SPEC.md` Appendix A. No Authorizer service implementation exists yet.
+Both reference implementations are functional and tested (`packages/sdk`: 34 passing cases; `packages/contracts`: 42 passing cases, including a full cryptographically-real withdrawal end to end and a single test driving the complete deposit-to-release lifecycle across both chains). Neither is audited. Several deployment parameters and byte-level formats remain open — see `docs/SPEC.md` Appendix A. No Authorizer service implementation exists yet.
 
 ## Development
 
