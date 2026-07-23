@@ -355,6 +355,13 @@ contract BridgeLock {
                 emit DustCollected(dust, collectedDust);
             }
         }
+        // A deposit whose entire netAmount is smaller than `scale` floors to
+        // xecAmount == 0 in the divide branch above -- the whole deposit would
+        // become collectedDust for a zero-quantity mint, with refund() then
+        // permanently closed by d.confirmed below and no way back (audit finding,
+        // 2026-07 review). Reverting here, before any state changes, leaves
+        // refund() open instead of silently forfeiting the deposit.
+        if (xecAmount == 0) revert AmountTooSmall();
         // SLP quantities are a fixed 8-byte (uint64) field -- xecAmount can never
         // legitimately exceed that, no matter how large `token`'s own decimals allow
         // a single deposit to be. This is a *hard* revert, not dust: dust only ever
@@ -414,6 +421,11 @@ contract BridgeLock {
         Authorization storage a = _authorizations[depositId];
         uint256 amount = xecHasMorePrecision ? uint256(d.netAmount) * scale : uint256(d.netAmount) / scale;
         if (amount > type(uint64).max) revert AmountTooLarge();
+        // Mirrors confirmDeposit()'s own AmountTooSmall revert -- a deposit whose
+        // converted amount floors to 0 can never actually be confirmed, so this
+        // returns the same revert instead of reporting a value that doesn't
+        // correspond to anything confirmDeposit() could ever produce.
+        if (amount == 0) revert AmountTooSmall();
         return (d.confirmed, d.xecRecipient, uint64(amount), a.utxoTxid, a.utxoIndex, a.v, a.r, a.s);
     }
 
@@ -572,6 +584,13 @@ contract BridgeLock {
         if (xecHasMorePrecision) {
             uint256 net = uint256(burnQuantity) - feeAmountXec;
             releaseAmount = net / scale;
+            // A burn just above feeAmountXec but still smaller than feeAmountXec +
+            // scale floors to releaseAmount == 0 here -- the burner's already-
+            // irreversible eCash-side burn would otherwise be marked redeemed
+            // (above) and pay out nothing (audit finding, 2026-07 review).
+            // Reverting unwinds that write too, since nothing here has externally
+            // executed yet.
+            if (releaseAmount == 0) revert AmountTooSmall();
             uint256 dust = pendingXecDust + (net % scale);
             if (dust >= scale) {
                 uint256 wholeUnits = dust / scale;
