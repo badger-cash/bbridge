@@ -3,7 +3,7 @@
 # bbridge Protocol Specification
 
 ### Specification version: 0.2
-### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 75 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
+### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 76 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
 
 # Table of Contents
 
@@ -124,6 +124,8 @@ Once a deposit has aged past a fixed, contract-enforced confirmation-depth thres
 - an ECDSA signature (`v`, `r`, `s`).
 
 The contract computes the expected authorization content (Section III.4) from data it already recorded at Lock time plus `utxoTxid`/`utxoIndex`, converts `netAmount` to XEC-side units (Section III.1's Decimal scaling), and verifies the supplied signature against that computed content via `ecrecover`. The Authorizer's submission is otherwise unconstrained by nothing it can choose except the outpoint and the signature itself — it does not submit, and cannot alter, the recipient or amount.
+
+**Signature canonicalization (2026-07 review, round 4).** Before ever calling `ecrecover`, the contract rejects any signature whose `s` value exceeds `secp256k1n / 2` — the standard low-S bound (the same one OpenZeppelin's `ECDSA.sol` enforces). Without this, every valid signature's mathematically equivalent malleated twin `(v', r, n - s)` recovers to the identical `authorizer` address, so an unprivileged mempool observer could front-run any pending, legitimate confirmation with the twin: it succeeds identically, but permanently stores the other byte-encoding as this deposit's published authorization (Section III.5). Because eCash/BCH-family consensus mandates strict-DER, low-S encoding for `OP_CHECKDATASIG`/`OP_CHECKDATASIGVERIFY` (Section III.6's covenant check), a malleated high-S signature would be rejected by the real mint covenant — permanently stranding the deposit at zero attacker cost, since confirmation forecloses `refund()` (Section III.2) and the only published signature can never successfully mint.
 
 A second confirmation attempt for an already-confirmed or already-refunded deposit is rejected. Additionally, the referenced vault outpoint itself is tracked (`utxoConsumedBy`) and may back at most one confirmation, ever, regardless of `depositId` — this closes a replay gap a per-deposit check alone would miss: without it, a previously-confirmed `(utxoTxid, utxoIndex, v, r, s)` tuple, publicly readable the moment it's first used (Section III.5), could otherwise be replayed to confirm a *second*, unrelated deposit that happens to share the same recipient and amount.
 

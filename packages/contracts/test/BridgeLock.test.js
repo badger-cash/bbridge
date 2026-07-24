@@ -211,6 +211,36 @@ describe('BridgeLock', function () {
     )
   })
 
+  it('rejects a malleated twin of an otherwise-valid Authorizer signature (2026-07 review, round 4, signature-malleability fix)', async function () {
+    // The real point: (v, r, N-s) with a flipped v recovers to the exact same address
+    // as (v, r, s) -- not an arbitrary corrupt signature, the actual second valid
+    // encoding every ECDSA signature has. Before this fix, an unprivileged mempool
+    // observer could front-run a legitimate confirmDeposit() call with this twin,
+    // permanently storing the non-canonical encoding getAuthorization() would later
+    // hand back for minting.
+    const { depositId, xecRecipient, xecAmount } = await makeDeposit(ethers.utils.parseUnits('25', 6))
+    const { utxoTxid, utxoIndex } = randomUtxo()
+    const { v, r, s } = await signAuthorization(authorizerWallet, {
+      depositId,
+      chainId,
+      utxoTxid,
+      utxoIndex,
+      xecTokenId,
+      xecAmount,
+      xecRecipient
+    })
+
+    const SECP256K1_N = ethers.BigNumber.from('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141')
+    const sMalleated = ethers.utils.hexZeroPad(SECP256K1_N.sub(s).toHexString(), 32)
+    const vMalleated = v === 27 ? 28 : 27
+
+    for (let i = 0; i < minConfirmations; i++) await ethers.provider.send('evm_mine')
+
+    await expect(
+      bridge.confirmDeposit(depositId, utxoTxid, utxoIndex, vMalleated, r, sMalleated)
+    ).to.be.revertedWithCustomError(bridge, 'MalleableSignature')
+  })
+
   it('rejects replaying a valid signature against a different vault outpoint than the one it was signed for', async function () {
     // This is the exact attack invariant 7 depends on not being possible (contracts-spec.md `2.1`):
     // a signature must be bound to one specific outpoint, not reusable against another.

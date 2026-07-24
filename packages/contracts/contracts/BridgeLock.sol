@@ -43,6 +43,12 @@ contract BridgeLock is ReentrancyGuard {
     /// match what that covenant expects.
     uint64 private constant SLP_DUST_SATS = 546;
 
+    /// @dev secp256k1's group order, n, halved -- the standard low-S canonicalization
+    /// bound (same constant OpenZeppelin's `ECDSA.sol` uses). See confirmDeposit()'s
+    /// own doc comment (2026-07 review, round 4, signature-malleability finding) for
+    /// why this is checked here.
+    uint256 private constant _SECP256K1_N_DIV_2 = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+
     struct Deposit {
         address depositor;
         uint96 netAmount; // full-precision token base units (this contract's own decimals), after feeAmount
@@ -286,6 +292,7 @@ contract BridgeLock is ReentrancyGuard {
     error NotDepositor();
     error TooEarlyToConfirm();
     error InvalidAuthorizerSignature();
+    error MalleableSignature();
     error AmountTooSmall();
     error AmountTooLarge();
     error FeeTooSmallForScale();
@@ -518,6 +525,22 @@ contract BridgeLock is ReentrancyGuard {
     /// already live, which served no purpose once the depositor has signaled intent
     /// to exit and only widened the window during which both an ETH-side refund and
     /// an XEC-side mint could complete against the same collateral.
+    ///
+    /// SIGNATURE MALLEABILITY (2026-07 review, round 4): every valid ECDSA signature
+    /// `(v, r, s)` has an equally `ecrecover`-valid twin `(v', r, n-s)` recovering to
+    /// the identical address, so without an explicit canonicalization check, any
+    /// unprivileged mempool observer could front-run a pending, legitimate
+    /// confirmDeposit() call with the malleated twin -- both recover to `authorizer`,
+    /// so the front-run succeeds identically, but permanently stores the *other*
+    /// byte-encoding in `_authorizations[depositId]`, the sole channel
+    /// `getAuthorization()` exposes for building the eCash-side mint transaction.
+    /// eCash/BCH-family consensus mandates strict-DER, low-S encoding for
+    /// `OP_CHECKDATASIG`/`OP_CHECKDATASIGVERIFY` -- a malleated high-S signature would
+    /// be rejected by the real mint covenant, permanently stranding the deposit at
+    /// zero attacker cost (`d.confirmed` forecloses refund() below; the only stored
+    /// signature can never successfully mint). Closed the same way OpenZeppelin's
+    /// `ECDSA.sol` does: reject any `s` above `_SECP256K1_N_DIV_2` before ever calling
+    /// `ecrecover`, forcing every stored signature into its one canonical encoding.
     function confirmDeposit(bytes32 depositId, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s) external nonReentrant {
         Deposit storage d = deposits[depositId];
         if (d.depositor == address(0)) revert UnknownDeposit();
@@ -574,6 +597,7 @@ contract BridgeLock is ReentrancyGuard {
         // combination.
         if (xecAmount > type(uint64).max) revert AmountTooLarge();
 
+        if (uint256(s) > _SECP256K1_N_DIV_2) revert MalleableSignature();
         bytes32 digest =
             _authorizationDigest(depositId, utxoTxid, utxoIndex, uint64(xecAmount), d.xecRecipient);
         if (ecrecover(digest, v, r, s) != authorizer) revert InvalidAuthorizerSignature();
