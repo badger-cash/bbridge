@@ -243,6 +243,57 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
     ).to.be.revertedWithCustomError(Bridge, 'InvalidXecDecimals')
   })
 
+  it('constructor reverts if feeAmountXec would reach the uint64 ceiling and brick all withdrawals (2026-07 review, round 5)', async function () {
+    const authorizerWallet = ethers.Wallet.createRandom()
+
+    const Token = await ethers.getContractFactory('MockERC20')
+    const token = await Token.deploy('Test Token', 'TT')
+    await token.deployed()
+
+    const { rawTx: rawGenesisTx9 } = buildGenesis({ decimals: 9 })
+
+    // tokenDecimals=0 < xecDecimals=9 -> xecHasMorePrecision, scale=1e9.
+    // feeAmount * 1e9 = 2e19 >= type(uint64).max (~1.8446e19), so every uint64
+    // burnQuantity would fail release()'s `burnQuantity <= feeAmountXec` gate.
+    const Bridge = await ethers.getContractFactory('BridgeLock')
+    await expect(
+      Bridge.deploy(
+        token.address,
+        0,
+        rawGenesisTx9,
+        authorizerWallet.address,
+        ethers.BigNumber.from('20000000000'), // 2e10; *1e9 = 2e19 >= uint64 max
+        minConfirmations,
+        minDifficultyTarget,
+        refundDelay
+      )
+    ).to.be.revertedWithCustomError(Bridge, 'FeeTooLargeForScale')
+  })
+
+  it('constructor reverts on a zero refundDelay, which would neuter the refund cooldown (2026-07 review, round 5)', async function () {
+    const authorizerWallet = ethers.Wallet.createRandom()
+
+    const Token = await ethers.getContractFactory('MockERC20')
+    const token = await Token.deploy('Test Token', 'TT')
+    await token.deployed()
+
+    const { rawTx: rawGenesisTx9 } = buildGenesis({ decimals: 9 })
+
+    const Bridge = await ethers.getContractFactory('BridgeLock')
+    await expect(
+      Bridge.deploy(
+        token.address,
+        6,
+        rawGenesisTx9,
+        authorizerWallet.address,
+        1_000,
+        minConfirmations,
+        minDifficultyTarget,
+        0 // refundDelay -- rejected
+      )
+    ).to.be.revertedWithCustomError(Bridge, 'ZeroRefundDelay')
+  })
+
   it('honors a deployer-chosen xecDecimals that differs from the max (e.g. genesis-ing the wrapped token at 6, matching a 6-decimal token exactly)', async function () {
     const { bridge, xecTokenId } = await deployBridge({ tokenDecimals: 6, xecDecimals: 6, feeAmount: 1_000n })
     expect(await bridge.xecDecimals()).to.equal(6)

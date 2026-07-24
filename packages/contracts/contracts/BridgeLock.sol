@@ -77,6 +77,13 @@ contract BridgeLock is ReentrancyGuard {
 
     // -- Deployment parameters (contracts-spec.md `3.`) --------------------------
 
+    /// @dev The wrapped ERC-20 held as collateral. Immutable, deployer-chosen. Assumed
+    /// non-rebasing: deposit() records `netAmount` from a measured balance delta, so it
+    /// tolerates fee-on-transfer tokens, but a *negative-rebasing* token whose balance
+    /// shrinks after deposit could pull the aggregate pool below the sum of recorded
+    /// `netAmount`s, breaking the refund/release solvency guarantee (invariant 3) for
+    /// the last claimants. Deploy only against non-rebasing tokens (2026-07 review,
+    /// round 5 lead).
     IERC20 public immutable token;
     address public immutable authorizer;
     uint96 public immutable feeAmount;
@@ -269,9 +276,10 @@ contract BridgeLock is ReentrancyGuard {
     /// requestRefund()'s own doc comment.
     event RefundRequested(bytes32 indexed depositId, uint256 requestedAtBlock);
     event RefundRequestCancelled(bytes32 indexed depositId);
-    /// @dev `tokenId` is included for off-chain transparency/indexing only -- it is
-    /// the burn's self-reported SLP token_id, not something this contract verifies
-    /// (see the note on `_parseBurnOpReturn` below for why not).
+    /// @dev `tokenId` is the burn's SLP token_id, verified by release() against
+    /// `xecTokenId` (WrongTokenId) since the 2026-07 review -- see `_parseBurnOpReturn`'s
+    /// own doc comment. Emitted for off-chain transparency/indexing. (Earlier drafts left
+    /// it unverified; this comment previously said so and was stale.)
     event WithdrawalReleased(bytes32 indexed burnTxid, address indexed recipient, uint256 amount, bytes32 tokenId);
     /// @dev Emitted whenever collectedDust increases, from either leg -- see
     /// collectedDust's own doc comment for what this value is and isn't.
@@ -296,6 +304,8 @@ contract BridgeLock is ReentrancyGuard {
     error AmountTooSmall();
     error AmountTooLarge();
     error FeeTooSmallForScale();
+    error FeeTooLargeForScale();
+    error ZeroRefundDelay();
     error InvalidXecDecimals();
     error UtxoAlreadyUsed();
     error WrongAsset();
@@ -328,6 +338,13 @@ contract BridgeLock is ReentrancyGuard {
         // signature parameters such as v not in {27,28}. Caught here once, permanently,
         // rather than left as an unrecoverable deployment mistake (audit finding #3).
         if (authorizer_ == address(0)) revert ZeroAuthorizer();
+
+        // requestRefund()/refundDelay is a defense-in-depth cooldown (see refund()'s
+        // own doc comment); a zero delay silently neuters it, letting requestRefund()
+        // and refund() land in the same block with no advance warning to the
+        // Authorizer's monitor. Rejected at construction rather than left as a
+        // permanent, immutable misconfiguration (2026-07 review, round 5 lead).
+        if (refundDelay_ == 0) revert ZeroRefundDelay();
 
         token = token_;
         tokenDecimals = tokenDecimals_;
@@ -363,6 +380,14 @@ contract BridgeLock is ReentrancyGuard {
 
         uint256 feeAmountXec_ = xecHasMorePrecision_ ? uint256(feeAmount_) * scale_ : feeAmount_ / scale_;
         if (feeAmount_ > 0 && feeAmountXec_ == 0) revert FeeTooSmallForScale();
+        // release() compares an XEC-side `burnQuantity` (uint64) against `feeAmountXec`
+        // via `if (burnQuantity <= feeAmountXec) revert AmountTooSmall()`. If
+        // feeAmountXec (a uint256 in the multiply direction) reaches type(uint64).max,
+        // no possible burn can exceed it and every withdrawal is permanently bricked
+        // while deposits still lock funds. Require it stays strictly below the uint64
+        // ceiling so at least one withdrawable quantity always exists above the fee
+        // (2026-07 review, round 5 lead).
+        if (feeAmountXec_ >= type(uint64).max) revert FeeTooLargeForScale();
         feeAmountXec = feeAmountXec_;
     }
 
@@ -964,6 +989,14 @@ contract BridgeLock is ReentrancyGuard {
 
     /// @dev Verifies the Authorizer's own signature on input 1 (the postage stamp),
     /// and that the signing key is actually the Authorizer's, not just some valid key.
+    ///
+    /// `stampValue` is caller-supplied by design, exactly like `release()`'s
+    /// `burnInputValue`: Bitcoin-family transactions don't self-describe their inputs'
+    /// coin values, so the value needed to reconstruct the BIP143 sighash can only come
+    /// from the caller. This is not a trust hole -- a wrong `stampValue` yields a digest
+    /// the Authorizer's real signature was never computed against, so verification
+    /// reverts `InvalidStampSignature`. It can only self-DoS the caller's own release
+    /// attempt; it can never redirect value or bypass the Authorizer check.
     function _verifyStampInput(EcashTx.Tx memory parsedTx, uint64 stampValue) private view {
         (bytes memory sig, bytes memory pubkey) = EcashTx.extractSigAndPubkey(parsedTx.inputs[1].scriptSig);
         (uint256 r, uint256 s, uint8 sighashType) = EcashTx.parseDER(sig);

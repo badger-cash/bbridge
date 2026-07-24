@@ -221,6 +221,11 @@ library EcashTx {
 
         uint256 rhs = addmod(mulmod(mulmod(x, x, P), x, P), B, P);
         y = modexp(rhs, (P + 1) / 4, P);
+        // modexp yields a real square root only when rhs is a quadratic residue (i.e.
+        // x is a genuine curve x-coordinate); for an off-curve x it returns a y with
+        // y^2 == -rhs, a bogus point. Reject it rather than pass an off-curve (x,y) to
+        // addressFromPubkey/verifyAgainstPubkey (2026-07 review, round 5 lead).
+        require(mulmod(y, y, P) == rhs, "EcashTx: point not on curve");
 
         bool yIsOdd = (y & 1) == 1;
         bool wantOdd = prefix == 0x03;
