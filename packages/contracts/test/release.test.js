@@ -2,7 +2,7 @@ const { expect } = require('chai')
 const { ethers } = require('hardhat')
 const crypto = require('crypto')
 const { buildGenesis } = require('./helpers/genesis')
-const { sdkRoot, signInput, p2pkhScript, u64be, bitsToTarget, mineSingleTxHeader, EASY_BITS } = require('./helpers/ecash')
+const { sdkRoot, signInput, p2pkhScript, u64be, chainIdToBE32, bitsToTarget, mineSingleTxHeader, EASY_BITS } = require('./helpers/ecash')
 
 const { KeyRing, Script, Coin, bcrypto } = require(sdkRoot + '/node_modules/@hansekontor/checkout-components')
 const { PreimageMTX } = require(sdkRoot + '/dist/src/preimage')
@@ -22,7 +22,9 @@ function buildSignedBurnTx({
   burnerOverride,
   burnerCoinOverride,
   recipientHash160Override,
-  burnInputValue
+  burnInputValue,
+  chainId,
+  chainIdOverride
 }) {
   const burner = burnerOverride ?? KeyRing.fromPrivate(crypto.randomBytes(32), true)
   const authorizer = KeyRing.fromPrivate(Buffer.from(authorizerPrivateKey.replace(/^0x/, ''), 'hex'), true)
@@ -59,6 +61,11 @@ function buildSignedBurnTx({
   // even though input 0 is signed by a different key (proving an attacker can't just
   // swap the signing key and keep the original attestation).
   const recipientHash160 = recipientHash160Override ?? Hash160.digest(burnerPubkey)
+  // chainId (2026-07 review, round 4, cross-chain-replay fix): the Authorizer-attested
+  // field release() now checks against its own deployment's immutable chainId.
+  // chainIdOverride lets a test push an arbitrary raw 32 bytes directly (e.g. a
+  // foreign chain's id) without needing a real chainId value for it.
+  const chainIdBytes = chainIdOverride ?? chainIdToBE32(chainId)
 
   const opReturn = new Script()
     .pushSym('return')
@@ -69,6 +76,7 @@ function buildSignedBurnTx({
     .pushData(u64be(burnQuantity))
     .pushData(assetId)
     .pushData(recipientHash160)
+    .pushData(chainIdBytes)
     .compile()
 
   const tx = new PreimageMTX()
@@ -117,7 +125,7 @@ describe('BridgeLock.release()', function () {
   const tokenId = Buffer.from(xecTokenIdHex.slice(2), 'hex')
   const burnQuantity = 5_000_000n // chosen divisible by scale so this leg has no dust to worry about here
 
-  let token, bridge, authorizerWallet, depositor
+  let token, bridge, authorizerWallet, depositor, chainId
 
   beforeEach(async function () {
     ;[depositor] = await ethers.getSigners()
@@ -140,6 +148,7 @@ describe('BridgeLock.release()', function () {
       20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )
     await bridge.deployed()
+    chainId = (await bridge.chainId()).toString()
 
     // fund the bridge so it has collateral to release
     await token.mint(bridge.address, ethers.utils.parseUnits('1000', 6))
@@ -149,6 +158,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue, stampCoin } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity
     })
@@ -171,6 +181,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity
     })
@@ -193,6 +204,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue, stampCoin } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity
     })
@@ -208,6 +220,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx: rawTx2, txid: txid2 } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity,
       stampCoinOverride: stampCoin
@@ -230,6 +243,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue, burner, burnerCoin } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity
     })
@@ -242,6 +256,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx: rawTx2, txid: txid2, stampValue: stampValue2 } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity,
       burnerOverride: burner,
@@ -260,6 +275,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: wrongAddress,
+      chainId,
       tokenId,
       burnQuantity
     })
@@ -275,6 +291,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue } = buildSignedBurnTx({
       authorizerPrivateKey: impostor.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity
     })
@@ -300,6 +317,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity,
       stampSighashType: SIGHASH_ALL | SIGHASH_FORKID | SIGHASH_ANYONECANPAY
@@ -316,6 +334,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId: wrongTokenId,
       burnQuantity
     })
@@ -326,10 +345,31 @@ describe('BridgeLock.release()', function () {
     ).to.be.revertedWithCustomError(bridge, 'WrongTokenId')
   })
 
+  it('rejects a burn attested for a different chainId (2026-07 review, round 4, cross-chain-replay fix)', async function () {
+    // Simulates a burn genuinely stamped by this exact Authorizer key for a sibling
+    // BridgeLock deployment on a different chain sharing the same address (e.g. via a
+    // CREATE2 factory used identically on both) and the same xecTokenId -- before this
+    // fix, nothing here depended on chain identity, so this would have released.
+    const wrongChainId = crypto.randomBytes(32)
+    const { rawTx, txid, stampValue } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      chainIdOverride: wrongChainId,
+      tokenId,
+      burnQuantity
+    })
+    const header = mineSingleTxHeader(txid)
+
+    await expect(
+      bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
+    ).to.be.revertedWithCustomError(bridge, 'WrongChainId')
+  })
+
   it('rejects a burn whose OP_RETURN-attested recipient is simply wrong', async function () {
     const { rawTx, txid, stampValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity,
       recipientHash160Override: crypto.randomBytes(20)
@@ -360,6 +400,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity,
       burnerOverride: attacker,
@@ -381,6 +422,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue, burnInputValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity,
       burnInputValue: 2200
@@ -396,6 +438,7 @@ describe('BridgeLock.release()', function () {
     const { rawTx, txid, stampValue, burnInputValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity,
       burnInputValue: 2200
@@ -421,7 +464,7 @@ describe('BridgeLock.release() with a >9-decimal token (Finding #2/#4 decimal sc
   const tokenId = Buffer.from(xecTokenIdHex.slice(2), 'hex')
   const burnQuantity = 5_000_000n // XEC-side units
 
-  let token, bridge, authorizerWallet
+  let token, bridge, authorizerWallet, chainId
 
   beforeEach(async function () {
     authorizerWallet = ethers.Wallet.createRandom()
@@ -442,6 +485,7 @@ describe('BridgeLock.release() with a >9-decimal token (Finding #2/#4 decimal sc
       20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )
     await bridge.deployed()
+    chainId = (await bridge.chainId()).toString()
 
     await token.mint(bridge.address, ethers.utils.parseUnits('1000000', 18))
   })
@@ -450,6 +494,7 @@ describe('BridgeLock.release() with a >9-decimal token (Finding #2/#4 decimal sc
     const { rawTx, txid, stampValue } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity
     })
@@ -481,7 +526,7 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
   const { rawTx: rawGenesisTx, tokenId: xecTokenIdHex } = buildGenesis({ decimals: xecDecimals })
   const tokenId = Buffer.from(xecTokenIdHex.slice(2), 'hex')
 
-  let token, bridge, authorizerWallet
+  let token, bridge, authorizerWallet, chainId
 
   beforeEach(async function () {
     authorizerWallet = ethers.Wallet.createRandom()
@@ -502,6 +547,7 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
       20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )
     await bridge.deployed()
+    chainId = (await bridge.chainId()).toString()
 
     await token.mint(bridge.address, ethers.utils.parseUnits('1000', 6))
   })
@@ -512,6 +558,7 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
     const { rawTx: rawTx1, txid: txid1, stampValue: stampValue1 } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity: burnQuantity1
     })
@@ -533,6 +580,7 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
     const { rawTx: rawTx2, txid: txid2, stampValue: stampValue2 } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
+      chainId,
       tokenId,
       burnQuantity: burnQuantity2
     })

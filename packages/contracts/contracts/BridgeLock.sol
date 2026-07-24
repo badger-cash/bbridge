@@ -79,7 +79,9 @@ contract BridgeLock is ReentrancyGuard {
     /// difficulty -- see Difficulty.meetsFloor) a withdrawal's block header must clear.
     uint256 public immutable minDifficultyTarget;
     /// @dev `block.chainid` captured at construction, not a constructor argument --
-    /// bound into `_authorizationDigest` (2026-07 review) as a domain separator
+    /// bound into `_authorizationDigest` (2026-07 review) and, since round 4, into
+    /// the BURN OP_RETURN's own `chainId` field checked by `release()` (see
+    /// `_parseBurnOpReturn`'s doc comment) -- both as a domain separator
     /// against a specific failure mode: two `BridgeLock` deployments that end up at
     /// the *same address* on two different chains (e.g. via a CREATE2 factory used
     /// identically on both), sharing the same `authorizer` key and the same wrapped
@@ -291,6 +293,7 @@ contract BridgeLock is ReentrancyGuard {
     error UtxoAlreadyUsed();
     error WrongAsset();
     error WrongTokenId();
+    error WrongChainId();
     error InvalidBurnSignature();
     error InvalidStampSignature();
     error HeaderBelowDifficultyFloor();
@@ -804,6 +807,19 @@ contract BridgeLock is ReentrancyGuard {
     /// itself is the resource that can legitimately back at most one release, and an
     /// honest postage service cannot fabricate a second one the way a compromised key
     /// could (see `burnUtxoConsumedBy`'s own doc comment for that narrower caveat).
+    ///
+    /// CROSS-CHAIN REPLAY (2026-07 review, round 4): `WrongAsset` above binds a burn
+    /// to a specific `address(this)`, but two `BridgeLock` deployments sharing the
+    /// same `authorizer` key and the same `xecTokenId` can land at the *identical*
+    /// address on two different chains (e.g. via a CREATE2 factory used identically
+    /// on both -- see `chainId`'s own doc comment, which already covers this failure
+    /// mode for `confirmDeposit()`). Before this fix, nothing checked here depended on
+    /// chain identity, so a single real burn+stamp+header, once mined and released on
+    /// one such deployment, could be replayed verbatim against the other for a second
+    /// full payout. Closed the same way `confirmDeposit()` already was: the BURN
+    /// OP_RETURN now carries its own `chainId` field (Authorizer-attested, covered by
+    /// the stamp's `hashOutputs` commitment like every other OP_RETURN field), checked
+    /// against this deployment's own immutable `chainId`.
     function release(
         bytes calldata rawBurnTx,
         uint64 burnInputValue,
@@ -829,10 +845,11 @@ contract BridgeLock is ReentrancyGuard {
             keccak256(abi.encodePacked(parsedTx.inputs[0].prevoutHash, parsedTx.inputs[0].prevoutIndex));
         if (burnUtxoConsumedBy[burnKey] != bytes32(0)) revert UtxoAlreadyUsed();
 
-        (bytes32 tokenId, uint64 burnQuantity, bytes32 assetId, bytes20 recipientHash160) =
+        (bytes32 tokenId, uint64 burnQuantity, bytes32 assetId, bytes20 recipientHash160, bytes32 burnChainId) =
             _parseBurnOpReturn(parsedTx.outputs[0].script);
         if (assetId != bytes32(bytes20(address(this)))) revert WrongAsset();
         if (tokenId != xecTokenId) revert WrongTokenId();
+        if (burnChainId != bytes32(chainId)) revert WrongChainId();
         if (burnQuantity <= feeAmountXec) revert AmountTooSmall();
 
         (address ethRecipient, bytes20 pubkeyHash160) = _verifyBurnInput(parsedTx, burnInputValue);
@@ -955,10 +972,18 @@ contract BridgeLock is ReentrancyGuard {
     /// actually the real coin's owner -- so anyone who observed an already-stamped
     /// burn could swap in their own key on input 0 (leaving its outpoint, and
     /// therefore the stamp's own validity, untouched) and steal the release.
+    ///
+    /// `chainId` (2026-07 review, round 4, cross-chain-replay finding): 32 bytes,
+    /// big-endian -- the same encoding `chainId`'s own doc comment and
+    /// `_authorizationDigest` already use for `confirmDeposit()`'s equivalent binding.
+    /// Checked by release() against this deployment's own immutable `chainId`, and
+    /// covered by the stamp's `hashOutputs` commitment like every other field here, so
+    /// an Authorizer-postaged burn is only ever valid on the one chain it was
+    /// attested for.
     function _parseBurnOpReturn(bytes memory script)
         private
         pure
-        returns (bytes32 tokenId, uint64 quantity, bytes32 assetId, bytes20 recipientHash160)
+        returns (bytes32 tokenId, uint64 quantity, bytes32 assetId, bytes20 recipientHash160, bytes32 chainId_)
     {
         require(uint8(script[0]) == 0x6a, "EcashTx: expected OP_RETURN");
         uint256 offset = 1;
@@ -994,6 +1019,11 @@ contract BridgeLock is ReentrancyGuard {
         (recipientBytes, offset) = EcashTx.readPush(script, offset);
         require(recipientBytes.length == 20, "BridgeLock: bad recipient length");
         recipientHash160 = bytes20(_bytesToBytes32(abi.encodePacked(recipientBytes, bytes12(0))));
+
+        bytes memory chainIdBytes;
+        (chainIdBytes, offset) = EcashTx.readPush(script, offset);
+        require(chainIdBytes.length == 32, "BridgeLock: bad chainId length");
+        chainId_ = _bytesToBytes32(chainIdBytes);
     }
 
     /// @dev Walks a raw transaction just far enough to reach its first output's

@@ -3,7 +3,7 @@
 # bbridge Protocol Specification
 
 ### Specification version: 0.2
-### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 74 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
+### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 75 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
 
 # Table of Contents
 
@@ -211,14 +211,16 @@ Once the postage-signed transaction is broadcast and confirmed, any party — no
 The contract, on receipt:
 
 1. Parses the transaction and its OP_RETURN.
-2. Verifies `assetId` (Section V) equals the contract's own address.
+2. Verifies `assetId` (Section V) equals the contract's own address, `tokenId` equals the deployment's genesis-derived token id, and `chainId` (Section V) equals the deployment's own chain id.
 3. Verifies the user's signature on the burn input and the Authorizer's signature on the postage input, the latter against the Authorizer's known key.
 4. Derives the release recipient and cross-checks it against the OP_RETURN's own attested recipient (Section IV.4).
 5. Verifies the supplied header is self-consistent with its own claimed difficulty and clears the deployment's minimum difficulty floor (Section IV.5).
 6. Verifies the Merkle path resolves the transaction to the supplied header's merkle root.
-7. Releases the burned quantity, net of the fixed withdrawal fee, to the derived recipient, and records the postage input's own outpoint as consumed to prevent a second release referencing the same stamp coin.
+7. Releases the burned quantity, net of the fixed withdrawal fee, to the derived recipient, and records both the postage input's own outpoint and the burn input's own outpoint as consumed, to prevent a second release referencing either the same stamp coin or the same burn declaration.
 
-   **Why the postage outpoint, not the transaction's own hash (2026-07 review):** a check keyed on the burn transaction's own hash is defeated by ECDSA signature malleability (or non-canonical DER padding) — either signature on an already-legitimately-postaged burn can be re-encoded into a byte-different transaction with a new hash while spending the exact same two coins under the exact same authorization. Combined with this design's single-header check (step 5, which deliberately verifies only self-consistency and a difficulty floor, not real chain-tip continuity — Section VI's two-factor framing), an attacker who once observes a real postaged burn could mine their own throwaway header off to the side and resubmit a re-encoded version under it. The postage input's own outpoint is invariant under any such re-encoding — malleation changes signature bytes, never which coin an input references — so keying the check there closes the replay regardless of which header or byte-encoding a resubmission uses. The burn coin's own outpoint isn't independently tracked the same way: on a real deployment it can only be spent once by XEC consensus, and not co-signing postage against an already-spent one is the Authorizer's own operational responsibility.
+   **Why the postage outpoint, not the transaction's own hash (2026-07 review):** a check keyed on the burn transaction's own hash is defeated by ECDSA signature malleability (or non-canonical DER padding) — either signature on an already-legitimately-postaged burn can be re-encoded into a byte-different transaction with a new hash while spending the exact same two coins under the exact same authorization. Combined with this design's single-header check (step 5, which deliberately verifies only self-consistency and a difficulty floor, not real chain-tip continuity — Section VI's two-factor framing), an attacker who once observes a real postaged burn could mine their own throwaway header off to the side and resubmit a re-encoded version under it. The postage input's own outpoint is invariant under any such re-encoding — malleation changes signature bytes, never which coin an input references — so keying the check there closes the replay regardless of which header or byte-encoding a resubmission uses.
+
+   **Why the burn outpoint too, not just the postage outpoint (revised 2026-07 review, round 4):** it was originally reasoned that the burn coin's own outpoint didn't need independent tracking, since on a real deployment it can only be spent once by XEC consensus, and not co-signing postage against an already-spent one is the Authorizer's own operational responsibility (Section IV.6). That reasoning missed a narrower gap: because the burn input's signature uses `SIGHASH_ANYONECANPAY` (valid glued to any co-input, Section IV.1) and this design's header check never requires real chain-tip inclusion (step 5), an *honest* Authorizer key that co-signs two distinct, both-genuine postage stamps for the *same* burn declaration — an ordinary service race or retry, no key compromise required — is sufficient on its own for a second full release. Tracking the burn input's own outpoint alongside the postage outpoint closes this: the burn declaration itself is the resource that can legitimately back at most one release, and an honest postage service cannot fabricate a second one the way a compromised key could fabricate a second fake outpoint (Section IV.6).
 
 ## 4. Recipient Derivation
 
@@ -287,12 +289,15 @@ A bridge-specific variant of the standard SLP Type 2 BURN format:
 | 5 | 8 | Burn quantity, big-endian |
 | 6 | 32 | `assetId` |
 | 7 | 20 | `recipientHash160` |
+| 8 | 32 | `chainId`, big-endian |
 
 `token_id` (push 4) *is* verified against `xecTokenId` (`WrongTokenId` if it doesn't match) — but `xecTokenId` is not a separately hand-typed constant the way an earlier draft of this contract used. It is derived, once, at construction, as the HASH256 of the raw GENESIS transaction bytes the deployer supplies (Section II) — by SLP convention, a token's `token_id` *is* the HASH256 of its own GENESIS transaction, so this value cannot independently drift from the token actually deployed on XEC the way a hand-typed constant could. This is a narrower guarantee than full SLP validity: it does not trace token lineage back through the transaction graph the way a real indexer would, and it doesn't need to — the Authorizer's decision to co-sign the postage input (Section IV.2) remains the operative attestation that a burn represents the *correct* wrapped token in the presumably-indexed sense; this check only additionally rules out a mismatch against what this specific deployment was actually genesis'd with.
 
 `assetId` (push 6) *is* independently verified (Section IV.3.2), against the releasing contract's own address. This is a distinct kind of check from `token_id`: a trivial, self-referential domain separator requiring no external data or trust, present to scope a burn to the correct bridge deployment even under a fully honest Authorizer (for example, one Authorizer key backing multiple deployments).
 
 `recipientHash160` (push 7, 2026-07 review) *is* independently verified (Section IV.4) against the `hash160` of whichever key actually signed input 0. See Section IV.4's own note for the full reasoning — in short, this field closes a gap where the release recipient was derivable from any self-consistent signature on input 0, with no check that the signing key was actually the burned coin's real owner.
+
+`chainId` (push 8, 2026-07 review, round 4) *is* independently verified (Section IV.3.2) against the releasing contract's own `block.chainid`, captured immutably at construction. Closes a gap `assetId` alone left open: two `BridgeLock` deployments can share the identical address on two different chains (e.g. via a CREATE2 factory used identically on both) while sharing the same `authorizer` key and `xecTokenId`, in which case `assetId`/`token_id` alone don't distinguish them, and a single real burn+stamp+header could otherwise be replayed verbatim across both for a duplicate payout. The same reasoning already applies to `confirmDeposit()`'s `chainId` binding (Section III.4) — see that field's own note.
 
 ### Merkle proofs
 

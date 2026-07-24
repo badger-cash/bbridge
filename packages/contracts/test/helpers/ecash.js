@@ -34,6 +34,13 @@ function u64be(n) {
   return buf
 }
 
+// Mirrors packages/sdk/src/script.ts's chainIdToBE32 (confirmDeposit()'s own
+// chainId encoding) -- release()'s BURN OP_RETURN chainId field uses the identical
+// 32-byte big-endian convention (2026-07 review, round 4, cross-chain-replay fix).
+function chainIdToBE32(chainId) {
+  return Buffer.from(BigInt(chainId).toString(16).padStart(64, '0'), 'hex')
+}
+
 function bitsToTarget(bits) {
   const exponent = bits >>> 24
   const mantissa = bits & 0x007fffff
@@ -75,4 +82,4 @@ function mineSingleTxHeader(merkleRoot) {
   }
 }
 
-module.exports = { sdkRoot, signInput, p2pkhScript, u64be, bitsToTarget, hashToUint, EASY_BITS, mineSingleTxHeader }
+module.exports = { sdkRoot, signInput, p2pkhScript, u64be, chainIdToBE32, bitsToTarget, hashToUint, EASY_BITS, mineSingleTxHeader }

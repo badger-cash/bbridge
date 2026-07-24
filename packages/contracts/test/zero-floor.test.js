@@ -3,7 +3,7 @@ const { ethers } = require('hardhat')
 const crypto = require('crypto')
 const { buildGenesis } = require('./helpers/genesis')
 const { signAuthorization } = require('./helpers/authorization')
-const { sdkRoot, signInput, p2pkhScript, u64be, mineSingleTxHeader, EASY_BITS, bitsToTarget } = require('./helpers/ecash')
+const { sdkRoot, signInput, p2pkhScript, u64be, chainIdToBE32, mineSingleTxHeader, EASY_BITS, bitsToTarget } = require('./helpers/ecash')
 
 const { KeyRing, Script, Coin, bcrypto } = require(sdkRoot + '/node_modules/@hansekontor/checkout-components')
 const { PreimageMTX } = require(sdkRoot + '/dist/src/preimage')
@@ -124,7 +124,7 @@ describe('BridgeLock zero-floor fixes', function () {
     const { rawTx: rawGenesisTx, tokenId: xecTokenIdHex } = buildGenesis({ decimals: xecDecimals })
     const tokenId = Buffer.from(xecTokenIdHex.slice(2), 'hex')
 
-    let token, bridge, authorizerWallet
+    let token, bridge, authorizerWallet, chainId
 
     beforeEach(async function () {
       authorizerWallet = ethers.Wallet.createRandom()
@@ -145,6 +145,7 @@ describe('BridgeLock zero-floor fixes', function () {
         refundDelay
       )
       await bridge.deployed()
+      chainId = (await bridge.chainId()).toString()
       await token.mint(bridge.address, ethers.utils.parseUnits('1000', 6))
     })
 
@@ -169,6 +170,7 @@ describe('BridgeLock zero-floor fixes', function () {
         .pushData(u64be(burnQuantity))
         .pushData(assetId)
         .pushData(Hash160.digest(burner.getPublicKey())) // 2026-07 review: Authorizer-attested recipient
+        .pushData(chainIdToBE32(chainId)) // 2026-07 review, round 4: cross-chain-replay fix
         .compile()
 
       const tx = new PreimageMTX()

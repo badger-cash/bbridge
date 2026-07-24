@@ -3,7 +3,7 @@ const { ethers } = require('hardhat')
 const crypto = require('crypto')
 const { buildGenesis } = require('./helpers/genesis')
 const { signAuthorization } = require('./helpers/authorization')
-const { sdkRoot, signInput, p2pkhScript, u64be, mineSingleTxHeader, EASY_BITS, bitsToTarget } = require('./helpers/ecash')
+const { sdkRoot, signInput, p2pkhScript, u64be, chainIdToBE32, mineSingleTxHeader, EASY_BITS, bitsToTarget } = require('./helpers/ecash')
 
 const { Address, Coin, KeyRing, Output, Script, bcrypto } = require(sdkRoot + '/node_modules/@hansekontor/checkout-components')
 const { PreimageMTX } = require(sdkRoot + '/dist/src/preimage')
@@ -212,6 +212,7 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
       .pushData(u64be(BigInt(xecAmountNum)))
       .pushData(assetId)
       .pushData(xecRecipientBuf) // 2026-07 review: Authorizer-attested recipient hash160
+      .pushData(chainIdToBE32(BigInt(chainId.toString()))) // 2026-07 review, round 4: cross-chain-replay fix
       .compile()
 
     const burnTx = new PreimageMTX()
