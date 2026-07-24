@@ -19,16 +19,9 @@ const { Hash160 } = bcrypto
 // (three independently-converging agents); fixed by reverting AmountTooSmall
 // before any state changes when the converted amount is exactly 0.
 
-function bytes8FromAscii(str) {
-  const buf = Buffer.alloc(8)
-  Buffer.from(str, 'ascii').copy(buf)
-  return '0x' + buf.toString('hex')
-}
-
 describe('BridgeLock zero-floor fixes', function () {
   const minConfirmations = 3
   const refundDelay = 20
-  const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1)
 
   describe('confirmDeposit(): a deposit whose converted xecAmount would floor to 0', function () {
@@ -39,7 +32,7 @@ describe('BridgeLock zero-floor fixes', function () {
     const feeAmount = 0n
     const { rawTx: rawGenesisTx } = buildGenesis({ decimals: xecDecimals })
 
-    let token, bridge, authorizerWallet, depositor
+    let token, bridge, authorizerWallet, depositor, chainId
 
     beforeEach(async function () {
       ;[depositor] = await ethers.getSigners()
@@ -58,11 +51,11 @@ describe('BridgeLock zero-floor fixes', function () {
         authorizerWallet.address,
         feeAmount,
         minConfirmations,
-        xecNetworkId,
         minDifficultyTarget,
         refundDelay
       )
       await bridge.deployed()
+      chainId = await bridge.chainId()
       await token.connect(depositor).approve(bridge.address, ethers.constants.MaxUint256)
     })
 
@@ -107,6 +100,7 @@ describe('BridgeLock zero-floor fixes', function () {
       const utxoTxid = '0x' + crypto.randomBytes(32).toString('hex')
       const { v, r, s } = await signAuthorization(authorizerWallet, {
         depositId,
+        chainId,
         utxoTxid,
         utxoIndex: 0,
         xecTokenId,
@@ -147,7 +141,6 @@ describe('BridgeLock zero-floor fixes', function () {
         authorizerWallet.address,
         feeAmount,
         minConfirmations,
-        xecNetworkId,
         ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString()),
         refundDelay
       )
@@ -196,26 +189,30 @@ describe('BridgeLock zero-floor fixes', function () {
       tx.inputs[1].script.fromItems([stampSig, authorizer.getPublicKey()])
 
       tx.check(flags)
-      return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, burner }
+      return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, burner, stampCoin }
+    }
+
+    function stampUtxoKey(stampCoin) {
+      return ethers.utils.solidityKeccak256(['bytes32', 'uint32'], ['0x' + stampCoin.hash.toString('hex'), stampCoin.index])
     }
 
     it('reverts AmountTooSmall for a burn in the (feeAmountXec, feeAmountXec + scale) zero-floor window', async function () {
       const burnQuantity = feeAmountXec + 500n // net=500, releaseAmount=500/1000=0
-      const { rawTx, txid, stampValue } = buildSignedBurnTx(burnQuantity)
+      const { rawTx, txid, stampValue, stampCoin } = buildSignedBurnTx(burnQuantity)
       const header = mineSingleTxHeader(txid)
 
       await expect(
         bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
       ).to.be.revertedWithCustomError(bridge, 'AmountTooSmall')
 
-      // The revert unwinds the earlier `redeemed[burnTxid] = true` write too --
-      // the burn is not permanently stranded by this specific check.
-      expect(await bridge.redeemed('0x' + txid.toString('hex'))).to.equal(false)
+      // The revert unwinds the earlier `stampUtxoConsumedBy[stampKey] = burnTxid`
+      // write too -- the burn is not permanently stranded by this specific check.
+      expect(await bridge.stampUtxoConsumedBy(stampUtxoKey(stampCoin))).to.equal(ethers.constants.HashZero)
     })
 
     it('still releases normally for a burn just above that window', async function () {
       const burnQuantity = feeAmountXec + scale // net=1000, releaseAmount=1000/1000=1
-      const { rawTx, txid, stampValue, burner } = buildSignedBurnTx(burnQuantity)
+      const { rawTx, txid, stampValue, burner, stampCoin } = buildSignedBurnTx(burnQuantity)
       const header = mineSingleTxHeader(txid)
       const expectedRecipient = ethers.utils.computeAddress('0x' + burner.getPublicKey().toString('hex'))
 
@@ -225,7 +222,7 @@ describe('BridgeLock zero-floor fixes', function () {
 
       expect(event.args.recipient).to.equal(expectedRecipient)
       expect(event.args.amount).to.equal(1)
-      expect(await bridge.redeemed('0x' + txid.toString('hex'))).to.equal(true)
+      expect(await bridge.stampUtxoConsumedBy(stampUtxoKey(stampCoin))).to.equal('0x' + txid.toString('hex'))
     })
   })
 })

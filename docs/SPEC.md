@@ -3,7 +3,7 @@
 # bbridge Protocol Specification
 
 ### Specification version: 0.2
-### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 34 passing cases; `packages/contracts`: 63 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
+### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 64 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
 
 # Table of Contents
 
@@ -132,6 +132,7 @@ The signed message follows the [SLP self-mint protocol](https://github.com/badge
 
 ```
 message = depositId (32 bytes)
+        || chainId (32 bytes, big-endian)
         || utxoTxid (32 bytes, internal byte order) || utxoIndex (4 bytes, little-endian)
         || txOutputs
 digest  = SHA256(SHA256(message))
@@ -139,10 +140,11 @@ digest  = SHA256(SHA256(message))
 
 `txOutputs` is the *fully serialized* transaction output list the resulting mint transaction must produce — not just compact `(xecRecipient, amount)` fields: the SLP `MINT` OP_RETURN output for the wrapped token (Section V) followed by the network-dust-value P2PKH output paying `xecRecipient`, each encoded as the standard Bitcoin-family `value (8 bytes, little-endian) || scriptLen (1 byte) || script`. Every field is fixed-width for a given deployment, so `message` is always the same total length; the eCash-side covenant never has to parse a variable-length structure, only hash-compare bytes it doesn't itself construct.
 
-Both `utxoTxid`/`utxoIndex` (the vault outpoint, Section III.3) and `depositId` are bound into the signed message, not merely transmitted alongside the signature:
+`depositId`, `chainId`, `utxoTxid`/`utxoIndex` (the vault outpoint, Section III.3) are all bound into the signed message, not merely transmitted alongside the signature:
 
 - Without the outpoint bound in, the same signature could be replayed to authorize a mint against any vault UTXO the minter selects, rather than only the one the Authorizer referenced — violating invariant 7.
 - Without `depositId` bound in, a signature valid for one deposit could be replayed to confirm a *second*, unrelated deposit sharing the same recipient and amount (Section III.3) — this is why `depositId` is the first field, not carried separately. It plays no other role: the eCash-side covenant treats it as opaque, splitting it off and discarding it once the signature over it has been verified, since it exists purely as a permanent on-chain link back to `deposits(depositId)` on Ethereum, not as something the covenant itself checks against the real spend.
+- Without `chainId` bound in (added 2026-07 review, replacing a former `xecNetworkId` deployment parameter that was never actually consumed anywhere), a signature would remain valid if replayed against a *different* `BridgeLock` deployment's digest, in the specific case where that deployment shares both `address(this)` (e.g. via a CREATE2 factory deployed identically on two chains) and the same `authorizer` key. `chainId` is `block.chainid`, read from the EVM at construction rather than supplied by the deployer — unlike a hand-picked constructor argument, it can't be reused across chains by a copy-pasted deployment script the way the collision itself typically arises. Like `depositId`, it is opaque to the eCash-side covenant, split off and discarded, never checked against anything there — its entire protective value is in making the Ethereum-side `ecrecover` check fail for the wrong deployment.
 
 The Authorizer's signature is verified via Ethereum's `ecrecover` against `digest`. `digest`'s construction (double SHA-256) matches the hash the eCash-side covenant's own `OP_CHECKDATASIGVERIFY` check evaluates against the same message (eCash's single-hash `OP_CHECKDATASIG` semantics, composed with the covenant's own extra `OP_SHA256` step, together produce a full double-SHA256).
 
@@ -213,7 +215,9 @@ The contract, on receipt:
 4. Derives the release recipient (Section IV.4).
 5. Verifies the supplied header is self-consistent with its own claimed difficulty and clears the deployment's minimum difficulty floor (Section IV.5).
 6. Verifies the Merkle path resolves the transaction to the supplied header's merkle root.
-7. Releases the burned quantity, net of the fixed withdrawal fee, to the derived recipient, and records the transaction as redeemed to prevent a second release against the same burn.
+7. Releases the burned quantity, net of the fixed withdrawal fee, to the derived recipient, and records the postage input's own outpoint as consumed to prevent a second release referencing the same stamp coin.
+
+   **Why the postage outpoint, not the transaction's own hash (2026-07 review):** a check keyed on the burn transaction's own hash is defeated by ECDSA signature malleability (or non-canonical DER padding) — either signature on an already-legitimately-postaged burn can be re-encoded into a byte-different transaction with a new hash while spending the exact same two coins under the exact same authorization. Combined with this design's single-header check (step 5, which deliberately verifies only self-consistency and a difficulty floor, not real chain-tip continuity — Section VI's two-factor framing), an attacker who once observes a real postaged burn could mine their own throwaway header off to the side and resubmit a re-encoded version under it. The postage input's own outpoint is invariant under any such re-encoding — malleation changes signature bytes, never which coin an input references — so keying the check there closes the replay regardless of which header or byte-encoding a resubmission uses. The burn coin's own outpoint isn't independently tracked the same way: on a real deployment it can only be spent once by XEC consensus, and not co-signing postage against an already-spent one is the Authorizer's own operational responsibility.
 
 ## 4. Recipient Derivation
 
@@ -230,6 +234,8 @@ The recipient is never a caller-supplied parameter. Because burn transactions ar
 The header supplied in Section IV.3 is checked for internal self-consistency (its hash meets the difficulty implied by its own `bits` field) and for clearing a fixed, deployment-time difficulty floor. This check is deliberately scoped to the single referenced header — it does not verify header-chain continuity back to a known point, and is not intended to function as an independent, trustless inclusion guarantee the way a full light client would.
 
 Release requires both a valid Authorizer signature *and* a header clearing this floor; neither is sufficient alone. The Authorizer's signature remains the primary trust anchor; the proof-of-work floor is a second factor that raises the cost of a fraudulent release in the event that signature is ever compromised or misused, without claiming to independently prove canonical-chain inclusion.
+
+The single-header scoping described above means a self-mined, off-chain header (clearing only the floor, not real network difficulty, and not part of the real chain) is computationally cheap to produce. On its own this doesn't let an attacker forge anything, since they still need a genuine Authorizer postage signature they have no way to fabricate — but combined with ECDSA signature malleability, it once allowed an already-legitimately-postaged burn to be replayed under a self-mined header with a re-encoded (differently-hashed) transaction. Section IV.3 step 7's postage-outpoint tracking (2026-07 review) closes that replay; see that step's own note for the full reasoning.
 
 ---
 

@@ -4,12 +4,6 @@ const crypto = require('crypto')
 const { buildGenesis } = require('./helpers/genesis')
 const { signAuthorization } = require('./helpers/authorization')
 
-function bytes8FromAscii(str) {
-  const buf = Buffer.alloc(8)
-  Buffer.from(str, 'ascii').copy(buf)
-  return '0x' + buf.toString('hex')
-}
-
 function randomBytes32() {
   return '0x' + crypto.randomBytes(32).toString('hex')
 }
@@ -31,10 +25,9 @@ describe('BridgeLock', function () {
   const xecDecimals = 9 // matches the actual SLP GENESIS decimals for the wrapped token; > tokenDecimals, so scale=1000 and XEC is the more precise side
   const minConfirmations = 3
   const refundDelay = 20
-  const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1) // permissive floor; withdrawal PoW tested separately
 
-  let token, bridge, authorizerWallet, depositor, other, xecTokenId
+  let token, bridge, authorizerWallet, depositor, other, xecTokenId, chainId
 
   beforeEach(async function () {
     ;[depositor, other] = await ethers.getSigners()
@@ -56,11 +49,11 @@ describe('BridgeLock', function () {
       authorizerWallet.address,
       feeAmount,
       minConfirmations,
-      xecNetworkId,
       minDifficultyTarget,
       refundDelay
     )
     await bridge.deployed()
+    chainId = await bridge.chainId()
 
     await token.connect(depositor).approve(bridge.address, ethers.constants.MaxUint256)
   })
@@ -133,6 +126,7 @@ describe('BridgeLock', function () {
     const { utxoTxid, utxoIndex } = randomUtxo()
     const { v, r, s } = await signAuthorization(authorizerWallet, {
       depositId,
+      chainId,
       utxoTxid,
       utxoIndex,
       xecTokenId,
@@ -152,6 +146,7 @@ describe('BridgeLock', function () {
     const { utxoTxid, utxoIndex } = randomUtxo()
     const { v, r, s } = await signAuthorization(authorizerWallet, {
       depositId,
+      chainId,
       utxoTxid,
       utxoIndex,
       xecTokenId,
@@ -182,6 +177,7 @@ describe('BridgeLock', function () {
     const impostor = ethers.Wallet.createRandom()
     const { v, r, s } = await signAuthorization(impostor, {
       depositId,
+      chainId,
       utxoTxid,
       utxoIndex,
       xecTokenId,
@@ -205,6 +201,7 @@ describe('BridgeLock', function () {
     const utxoB = randomUtxo()
     const { v, r, s } = await signAuthorization(authorizerWallet, {
       depositId,
+      chainId,
       utxoTxid: utxoA.utxoTxid,
       utxoIndex: utxoA.utxoIndex,
       xecTokenId,
@@ -237,6 +234,7 @@ describe('BridgeLock', function () {
     const { utxoTxid, utxoIndex } = randomUtxo()
     const { v, r, s } = await signAuthorization(authorizerWallet, {
       depositId: depositIdA,
+      chainId,
       utxoTxid,
       utxoIndex,
       xecTokenId,
@@ -272,6 +270,7 @@ describe('BridgeLock', function () {
 
     const sigA = await signAuthorization(authorizerWallet, {
       depositId: depositIdA,
+      chainId,
       utxoTxid,
       utxoIndex,
       xecTokenId,
@@ -280,6 +279,7 @@ describe('BridgeLock', function () {
     })
     const sigB = await signAuthorization(authorizerWallet, {
       depositId: depositIdB,
+      chainId,
       utxoTxid,
       utxoIndex,
       xecTokenId,
@@ -301,6 +301,7 @@ describe('BridgeLock', function () {
     const utxo1 = randomUtxo()
     const { v, r, s } = await signAuthorization(authorizerWallet, {
       depositId,
+      chainId,
       utxoTxid: utxo1.utxoTxid,
       utxoIndex: utxo1.utxoIndex,
       xecTokenId,
@@ -314,6 +315,7 @@ describe('BridgeLock', function () {
     const utxo2 = randomUtxo()
     const sig2 = await signAuthorization(authorizerWallet, {
       depositId,
+      chainId,
       utxoTxid: utxo2.utxoTxid,
       utxoIndex: utxo2.utxoIndex,
       xecTokenId,
@@ -330,6 +332,7 @@ describe('BridgeLock', function () {
     const { utxoTxid, utxoIndex } = randomUtxo()
     const { v, r, s } = await signAuthorization(authorizerWallet, {
       depositId,
+      chainId,
       utxoTxid,
       utxoIndex,
       xecTokenId,

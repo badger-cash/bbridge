@@ -484,11 +484,15 @@ function data(d: Buffer): CovenantOp {
  *   minterSig, minterPubkey, preimage, authSig, message, <this compiled redeem script>
  *
  * - `message` is the exact signed content BridgeLock.sol's `_authorizationDigest`
- *   computes: `depositId(32) || utxoTxid(32) || utxoIndex(4, LE) || txOutputs`
- *   (see buildAuthorizationMessage). `depositId` is opaque here -- split off and
- *   dropped, never compared against anything -- its purpose is purely to leave an
- *   on-chain link back to `deposits(depositId)` on Ethereum, not to gate anything
- *   this covenant enforces.
+ *   computes: `depositId(32) || chainId(32, BE) || utxoTxid(32) || utxoIndex(4, LE)
+ *   || txOutputs` (see buildAuthorizationMessage). `depositId` and `chainId` are both
+ *   opaque here -- split off and dropped, never compared against anything -- their
+ *   purpose is entirely on the Ethereum side: `depositId` leaves an on-chain link
+ *   back to `deposits(depositId)`, and `chainId` (2026-07 review, replacing the
+ *   former unused `xecNetworkId`) stops a signature from one `BridgeLock` deployment
+ *   verifying against a different deployment's digest even in the degenerate case
+ *   where both share `address(this)` (see `BridgeLock.sol`'s `chainId` doc comment).
+ *   Neither is something this covenant enforces.
  * - `authSig` is the Authorizer's signature over HASH256(message).
  * - `preimage` is the *current* spending transaction's own BIP143 preimage
  *   (PreimageMTX.getPreimage), supplied directly by the minter.
@@ -525,6 +529,12 @@ export function mintCovenantV2Ops(authPublicKey: Buffer): CovenantOp[] {
     // depositId (32 bytes) is opaque -- split it off and discard it. OP_SPLIT
     // leaves [depositId, rest] with rest on top; OP_NIP drops the second-from-top
     // item, i.e. depositId, keeping rest.
+    int(32),
+    sym('split'),
+    sym('nip'),
+
+    // chainId (32 bytes) is also opaque -- same split-and-discard as depositId
+    // above (2026-07 review, replacing the former unused xecNetworkId field).
     int(32),
     sym('split'),
     sym('nip'),
@@ -638,11 +648,24 @@ export function buildMintV2TxOutputs(tokenId: Buffer, xecAmount: number, xecReci
 }
 
 /**
+ * 32-byte big-endian encoding of a chain ID, matching Solidity's
+ * `abi.encodePacked(uint256)` for `block.chainid` exactly. Built via BigInt/hex
+ * rather than a fixed-width integer writer since a chain ID is a `uint256` in
+ * principle -- Buffer has no native 256-bit writer, and going through `number`
+ * risks the same silent-precision-loss class of bug `U64.fromInt` had for amounts
+ * (see packages/sdk README's "Gotchas" section) once a chain ID exceeds 2**53.
+ */
+function chainIdToBE32(chainId: bigint | number): Buffer {
+  return Buffer.from(BigInt(chainId).toString(16).padStart(64, '0'), 'hex')
+}
+
+/**
  * Builds the exact message BridgeLock.sol's `_authorizationDigest` signs:
- * `depositId(32) || utxoTxid(32) || utxoIndex(4, LE) || txOutputs`.
+ * `depositId(32) || chainId(32, BE) || utxoTxid(32) || utxoIndex(4, LE) || txOutputs`.
  */
 export function buildAuthorizationMessage(
   depositId: Buffer,
+  chainId: bigint | number,
   utxoTxid: Buffer,
   utxoIndex: number,
   tokenId: Buffer,
@@ -653,6 +676,7 @@ export function buildAuthorizationMessage(
   utxoIndexBuf.writeUInt32LE(utxoIndex)
   return Buffer.concat([
     depositId,
+    chainIdToBE32(chainId),
     utxoTxid,
     utxoIndexBuf,
     buildMintV2TxOutputs(tokenId, xecAmount, xecRecipientHash160)

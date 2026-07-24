@@ -3,10 +3,13 @@ const crypto = require('crypto')
 // Mirrors BridgeLock.sol's _authorizationDigest / _buildMintTxOutputs exactly --
 // both build the same SLP self-mint Type 2 authorization message (see
 // badger-cash/slp-self-mint-protocol's "Merkle Proof Public Key Rotation" section):
-//   message = depositId(32) || utxoTxid(32) || utxoIndex(4, LE) || txOutputs
+//   message = depositId(32) || chainId(32, BE) || utxoTxid(32) || utxoIndex(4, LE) || txOutputs
 // where txOutputs is the fully serialized MINT OP_RETURN + SLP_DUST_SATS recipient
 // P2PKH output, not just compact (xecRecipient, xecAmount) fields -- kept in sync by
 // hand since this is a test-only JS mirror, not shared code with the contract.
+// chainId is BridgeLock.sol's own `chainId` immutable (block.chainid captured at
+// construction, 2026-07 review) -- callers must pass the deployed contract's own
+// `await bridge.chainId()`, not assume a fixed value.
 
 const SLP_DUST_SATS = 546
 
@@ -36,6 +39,10 @@ function u32LE(value) {
   return buf
 }
 
+function chainIdBE32(chainId) {
+  return Buffer.from(BigInt(chainId).toString(16).padStart(64, '0'), 'hex')
+}
+
 // Mirrors BridgeLock._buildMintTxOutputs.
 function buildMintTxOutputs(xecTokenId, xecAmount, xecRecipient) {
   const tokenId = toBuf(xecTokenId)
@@ -62,9 +69,10 @@ function buildMintTxOutputs(xecTokenId, xecAmount, xecRecipient) {
   return Buffer.concat([mintOutput, recipientOutput])
 }
 
-function buildAuthorizationMessage({ depositId, utxoTxid, utxoIndex, xecTokenId, xecAmount, xecRecipient }) {
+function buildAuthorizationMessage({ depositId, chainId, utxoTxid, utxoIndex, xecTokenId, xecAmount, xecRecipient }) {
   return Buffer.concat([
     toBuf(depositId),
+    chainIdBE32(chainId),
     toBuf(utxoTxid),
     u32LE(utxoIndex),
     buildMintTxOutputs(xecTokenId, xecAmount, xecRecipient)

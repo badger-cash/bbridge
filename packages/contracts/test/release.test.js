@@ -12,7 +12,7 @@ const { Hash160 } = bcrypto
 /// BridgeLock.release() expects (overview.md `6.`), using the underlying eCash
 /// primitives directly since packages/sdk doesn't have a burn/postage builder
 /// yet (overview.md `9.`, "No burn/postage transaction builder exists yet").
-function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQuantity, stampSighashType }) {
+function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQuantity, stampSighashType, stampCoinOverride }) {
   const burner = KeyRing.fromPrivate(crypto.randomBytes(32), true)
   const authorizer = KeyRing.fromPrivate(Buffer.from(authorizerPrivateKey.replace(/^0x/, ''), 'hex'), true)
 
@@ -23,7 +23,11 @@ function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQ
 
   const burnerCoin = new Coin({ hash: crypto.randomBytes(32), index: 0, value: 546, script: burnerScript })
   const stampValue = 2000
-  const stampCoin = new Coin({ hash: crypto.randomBytes(32), index: 0, value: stampValue, script: authorizerScript })
+  // stampCoinOverride lets a caller reuse the exact same stamp outpoint across two
+  // otherwise-independent burn transactions -- standing in for a malleated
+  // re-encoding (same authorization, different txid) without needing to hand-flip
+  // DER signature bytes; see the "malleated resubmission" test below.
+  const stampCoin = stampCoinOverride ?? new Coin({ hash: crypto.randomBytes(32), index: 0, value: stampValue, script: authorizerScript })
 
   const assetId = Buffer.concat([Buffer.from(bridgeAddress.replace(/^0x/, ''), 'hex'), Buffer.alloc(12)])
 
@@ -63,7 +67,14 @@ function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQ
 
   tx.check(flags) // real eCash script verification, same as packages/sdk's own tests
 
-  return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue }
+  return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, stampCoin }
+}
+
+// Mirrors BridgeLock.sol's `keccak256(abi.encodePacked(prevoutHash, prevoutIndex))` for
+// the stamp input -- the real single-use nonce stampUtxoConsumedBy tracks (see that
+// mapping's own doc comment for why it replaced the old burnTxid-keyed `redeemed`).
+function stampUtxoKey(stampCoin) {
+  return ethers.utils.solidityKeccak256(['bytes32', 'uint32'], ['0x' + stampCoin.hash.toString('hex'), stampCoin.index])
 }
 
 describe('BridgeLock.release()', function () {
@@ -72,7 +83,6 @@ describe('BridgeLock.release()', function () {
   const xecDecimals = 9 // matches the actual SLP GENESIS decimals; > tokenDecimals, so scale=1000 (feeAmountXec = feeAmount*1000)
   const scale = 1000n
   const feeAmountXec = feeAmount * scale
-  const xecNetworkId = '0x' + Buffer.from('ETH').toString('hex').padEnd(16, '0')
   const { rawTx: rawGenesisTx, tokenId: xecTokenIdHex } = buildGenesis({ decimals: xecDecimals })
   const tokenId = Buffer.from(xecTokenIdHex.slice(2), 'hex')
   const burnQuantity = 5_000_000n // chosen divisible by scale so this leg has no dust to worry about here
@@ -96,7 +106,6 @@ describe('BridgeLock.release()', function () {
       authorizerWallet.address,
       feeAmount,
       3,
-      xecNetworkId,
       ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString()),
       20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )
@@ -107,7 +116,7 @@ describe('BridgeLock.release()', function () {
   })
 
   it('releases collateral to the burner-derived address for a valid burn + inclusion proof', async function () {
-    const { rawTx, txid, stampValue } = buildSignedBurnTx({
+    const { rawTx, txid, stampValue, stampCoin } = buildSignedBurnTx({
       authorizerPrivateKey: authorizerWallet.privateKey,
       bridgeAddress: bridge.address,
       tokenId,
@@ -125,7 +134,7 @@ describe('BridgeLock.release()', function () {
     expect(event.args.amount.toBigInt()).to.equal(expectedReleaseAmount)
     expect(event.args.tokenId.slice(2)).to.equal(tokenId.toString('hex'))
     expect((await token.balanceOf(bridge.address)).toBigInt()).to.equal(before.toBigInt() - expectedReleaseAmount)
-    expect(await bridge.redeemed('0x' + txid.toString('hex'))).to.equal(true)
+    expect(await bridge.stampUtxoConsumedBy(stampUtxoKey(stampCoin))).to.equal('0x' + txid.toString('hex'))
   })
 
   it('rejects redeeming the same burn transaction twice', async function () {
@@ -141,7 +150,44 @@ describe('BridgeLock.release()', function () {
 
     await expect(
       bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
-    ).to.be.revertedWithCustomError(bridge, 'AlreadyRedeemed')
+    ).to.be.revertedWithCustomError(bridge, 'UtxoAlreadyUsed')
+  })
+
+  it('rejects a resubmission that reuses the same stamp UTXO under a malleated (differently-encoded) signature', async function () {
+    // The real point of stampUtxoConsumedBy over the old burnTxid-keyed mapping:
+    // flipping either signature's S value produces a different-looking, still-valid
+    // transaction (a different burnTxid) spending the exact same two coins under the
+    // exact same authorization. A burnTxid-keyed check would never have seen this
+    // txid before and would have let it through; the stamp outpoint is unchanged by
+    // any such re-encoding, so it isn't fooled.
+    const { rawTx, txid, stampValue, stampCoin } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity
+    })
+    const header = mineSingleTxHeader(txid)
+    await bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+
+    // Simulate a malleated resubmission by constructing an *independent* burn tx that
+    // spends the exact same stamp coin (same outpoint) -- standing in for "the same
+    // authorization, re-encoded" without needing to hand-flip DER bytes here: what
+    // stampUtxoConsumedBy actually keys on is the outpoint, not the signature bytes,
+    // so any transaction reusing that outpoint exercises the same check a real
+    // malleated re-encoding would hit.
+    const { rawTx: rawTx2, txid: txid2 } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity,
+      stampCoinOverride: stampCoin
+    })
+    expect(txid2.equals(txid)).to.equal(false)
+    const header2 = mineSingleTxHeader(txid2)
+
+    await expect(
+      bridge.release('0x' + rawTx2.toString('hex'), stampValue, [], 0, '0x' + header2.toString('hex'))
+    ).to.be.revertedWithCustomError(bridge, 'UtxoAlreadyUsed')
   })
 
   it('rejects a burn scoped to a different assetId (a different bridge deployment)', async function () {
@@ -225,7 +271,6 @@ describe('BridgeLock.release() with a >9-decimal token (Finding #2/#4 decimal sc
   const scale = 10n ** 9n
   const feeAmountXec = 5n
   const feeAmount = feeAmountXec * scale // must scale back to a nonzero feeAmountXec
-  const xecNetworkId = '0x' + Buffer.from('ETH').toString('hex').padEnd(16, '0')
   const { rawTx: rawGenesisTx, tokenId: xecTokenIdHex } = buildGenesis({ decimals: xecDecimals })
   const tokenId = Buffer.from(xecTokenIdHex.slice(2), 'hex')
   const burnQuantity = 5_000_000n // XEC-side units
@@ -247,7 +292,6 @@ describe('BridgeLock.release() with a >9-decimal token (Finding #2/#4 decimal sc
       authorizerWallet.address,
       feeAmount,
       3,
-      xecNetworkId,
       ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString()),
       20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )
@@ -288,7 +332,6 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
   const scale = 1000n
   const feeAmount = 1_000n
   const feeAmountXec = feeAmount * scale // 1_000_000, exact (multiply direction)
-  const xecNetworkId = '0x' + Buffer.from('ETH').toString('hex').padEnd(16, '0')
   const { rawTx: rawGenesisTx, tokenId: xecTokenIdHex } = buildGenesis({ decimals: xecDecimals })
   const tokenId = Buffer.from(xecTokenIdHex.slice(2), 'hex')
 
@@ -309,7 +352,6 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
       authorizerWallet.address,
       feeAmount,
       3,
-      xecNetworkId,
       ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString()),
       20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )

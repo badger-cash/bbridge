@@ -51,10 +51,26 @@ contract BridgeLock {
     address public immutable authorizer;
     uint96 public immutable feeAmount;
     uint32 public immutable minConfirmations;
-    bytes8 public immutable xecNetworkId;
     /// @dev Maximum acceptable target (a *ceiling* on target, i.e. a floor on
     /// difficulty -- see Difficulty.meetsFloor) a withdrawal's block header must clear.
     uint256 public immutable minDifficultyTarget;
+    /// @dev `block.chainid` captured at construction, not a constructor argument --
+    /// bound into `_authorizationDigest` (2026-07 review) as a domain separator
+    /// against a specific failure mode: two `BridgeLock` deployments that end up at
+    /// the *same address* on two different chains (e.g. via a CREATE2 factory used
+    /// identically on both), sharing the same `authorizer` key and the same wrapped
+    /// token. In that scenario `depositId`'s own `address(this)` binding stops
+    /// distinguishing the two deployments, since the address is identical by
+    /// construction. `chainId` doesn't have that failure mode: it's read from the
+    /// EVM itself at deployment time, not supplied by the deployer, so unlike a
+    /// deployer-chosen constant it can't be accidentally (or deliberately) reused
+    /// across chains the way an address or a hand-picked label can. This is the same
+    /// reasoning EIP-712 domain separators bind `chainid` for, applied here instead
+    /// of a general typed-data scheme. Replaces the former `xecNetworkId` constructor
+    /// parameter, which was deployer-supplied (exactly as reusable-by-mistake as the
+    /// address it was meant to guard against) and, in any case, was never actually
+    /// read anywhere in this contract or consumed by `packages/sdk`.
+    uint256 public immutable chainId;
 
     /// @dev Minimum number of blocks that must elapse between a live requestRefund()
     /// call and refund() itself succeeding (2026-07 review, defense-in-depth layer
@@ -147,7 +163,6 @@ contract BridgeLock {
 
     mapping(bytes32 depositId => Deposit) public deposits;
     mapping(bytes32 depositId => Authorization) private _authorizations;
-    mapping(bytes32 burnTxid => bool) public redeemed;
     /// @dev Each eCash vault outpoint (utxoTxid, utxoIndex) names one specific,
     /// once-spendable coin, so it can legitimately back at most one confirmation,
     /// ever (audit finding #1: without this, an old (utxoTxid, utxoIndex, v, r, s)
@@ -159,6 +174,36 @@ contract BridgeLock {
     /// key is a purely internal ETH-side bookkeeping value, not something the eCash
     /// covenant needs to know or reproduce. See confirmDeposit().
     mapping(bytes32 utxoKey => bytes32 depositId) public utxoConsumedBy;
+    /// @dev The withdrawal-side counterpart to utxoConsumedBy above -- each eCash
+    /// stamp/postage outpoint (release()'s input 1) names one specific, once-
+    /// spendable coin, so it can legitimately back at most one release, ever. Keyed
+    /// by keccak256(prevoutHash, prevoutIndex) of that input, mapping to the burnTxid
+    /// that consumed it (0x0 = unused, matching utxoConsumedBy's own sentinel).
+    ///
+    /// Replaces a former `redeemed[burnTxid]` mapping (2026-07 review, audit findings
+    /// on header-forgery + signature malleability, considered together): keying replay
+    /// protection on the burn transaction's own hash was insufficient, because ECDSA
+    /// signature malleability (or non-canonical DER padding) lets an attacker
+    /// re-encode either signature on an already-legitimately-postaged burn into a
+    /// byte-different transaction with a *different* txid, while spending the exact
+    /// same two coins under the exact same authorization. Combined with this
+    /// contract's deliberately weak header check (single-header self-consistency +
+    /// difficulty floor only, no real chain-tip continuity -- see release()'s own doc
+    /// comment), an attacker who once observes a real, Authorizer-postaged burn can
+    /// mine their own throwaway low-difficulty header off to the side and resubmit a
+    /// malleated re-encoding under it, producing a new burnTxid the old mapping had
+    /// never seen. The stamp outpoint is invariant under any such re-encoding --
+    /// malleation changes scriptSig bytes, never which coin an input references, and
+    /// the stamp input's own (non-ANYONECANPAY) SIGHASH_ALL signature additionally
+    /// commits to the full, fixed input set -- so tracking it directly closes the
+    /// replay regardless of which header or which byte-encoding a resubmission uses.
+    /// Verifying the burn coin's own outpoint isn't similarly duplicated here: on a
+    /// real XEC deployment that coin can only ever be spent once by chain consensus,
+    /// and the Authorizer's own postage process is the operational checkpoint
+    /// responsible for not co-signing postage against an already-spent one -- a
+    /// business-process responsibility of the Authorizer service, not something this
+    /// contract's code can or should independently re-verify.
+    mapping(bytes32 stampUtxoKey => bytes32 burnTxid) public stampUtxoConsumedBy;
     uint256 private _depositNonce;
     /// @dev Block number of the live requestRefund() call for a given depositId, or
     /// 0 if none is outstanding. See requestRefund()/cancelRefundRequest()/refund().
@@ -201,7 +246,6 @@ contract BridgeLock {
     error FeeTooSmallForScale();
     error InvalidXecDecimals();
     error UtxoAlreadyUsed();
-    error AlreadyRedeemed();
     error WrongAsset();
     error WrongTokenId();
     error InvalidBurnSignature();
@@ -219,7 +263,6 @@ contract BridgeLock {
         address authorizer_,
         uint96 feeAmount_,
         uint32 minConfirmations_,
-        bytes8 xecNetworkId_,
         uint256 minDifficultyTarget_,
         uint256 refundDelay_
     ) {
@@ -236,9 +279,9 @@ contract BridgeLock {
         authorizer = authorizer_;
         feeAmount = feeAmount_;
         minConfirmations = minConfirmations_;
-        xecNetworkId = xecNetworkId_;
         minDifficultyTarget = minDifficultyTarget_;
         refundDelay = refundDelay_;
+        chainId = block.chainid;
 
         xecTokenId = sha256(abi.encodePacked(sha256(rawGenesisTx_)));
 
@@ -522,6 +565,7 @@ contract BridgeLock {
     }
 
     /// @dev message = depositId (32 bytes)
+    ///           || chainId (32 bytes, big-endian -- see `chainId`'s own doc comment)
     ///           || utxoTxid (32 bytes, internal byte order) || utxoIndex (4 bytes, little-endian)
     ///           || txOutputs (the exact serialized MINT OP_RETURN + recipient outputs, see below)
     /// digest = HASH256(message) = sha256(sha256(message)) -- matching what the eCash-side
@@ -556,6 +600,14 @@ contract BridgeLock {
     /// different one), and it leaves a permanent, on-chain-extractable link from the
     /// XEC-side mint back to `deposits(depositId)` on this contract, for anyone
     /// reconstructing the mint transaction or auditing it after the fact.
+    ///
+    /// `chainId` (2026-07 review, replacing the former unused `xecNetworkId` field --
+    /// see `chainId`'s own doc comment) is, like `depositId`, opaque to the covenant --
+    /// split off and discarded, never checked against anything eCash-side. Its role is
+    /// purely to stop a signature produced by one `BridgeLock` deployment from ever
+    /// verifying against the digest a *different* deployment computes, even in the
+    /// degenerate case where both deployments share `address(this)` (a possibility
+    /// `depositId`'s own address-binding can't rule out on its own -- see `chainId`).
     function _authorizationDigest(
         bytes32 depositId,
         bytes32 utxoTxid,
@@ -564,7 +616,7 @@ contract BridgeLock {
         bytes20 xecRecipient
     ) internal view returns (bytes32) {
         bytes memory message = abi.encodePacked(
-            depositId, utxoTxid, _uint32LE(utxoIndex), _buildMintTxOutputs(xecAmount, xecRecipient)
+            depositId, chainId, utxoTxid, _uint32LE(utxoIndex), _buildMintTxOutputs(xecAmount, xecRecipient)
         );
         return sha256(abi.encodePacked(sha256(message)));
     }
@@ -637,6 +689,25 @@ contract BridgeLock {
     /// Bitcoin-family transaction, this one doesn't self-describe its inputs' coin
     /// values -- contracts-spec.md `8.` flags this as still needing a real design
     /// decision (e.g. a fixed stamp weight) rather than an open caller-supplied value.
+    ///
+    /// HEADER-FORGERY + MALLEABILITY (2026-07 review): this contract's header check
+    /// below only verifies the supplied header is internally self-consistent and
+    /// clears `minDifficultyTarget` -- it does not verify the header is part of the
+    /// real XEC chain (no cumulative-work or chain-tip continuity check; a deliberate
+    /// design tradeoff, see the two-factor framing in overview.md `7.`). In isolation
+    /// this doesn't let an attacker forge anything, since they still need a real
+    /// Authorizer-produced postage signature they have no way to fabricate. But
+    /// combined with ECDSA signature malleability (or non-canonical DER padding),
+    /// which lets an already-legitimately-postaged burn be re-encoded into a
+    /// byte-different transaction with a new burnTxid while spending the exact same
+    /// two coins, an attacker who once observes a real postaged burn could mine their
+    /// own throwaway header off to the side and resubmit a malleated re-encoding
+    /// under it. Tracking `redeemed` by burnTxid alone would not have caught this,
+    /// since the malleated resubmission's txid was never seen before. This is why
+    /// single-use tracking below is keyed on the stamp input's own outpoint (see
+    /// `stampUtxoConsumedBy`'s own doc comment) rather than on `burnTxid`: the
+    /// outpoint is invariant under any re-encoding, so it closes the replay
+    /// regardless of which header or which byte-encoding a resubmission uses.
     function release(
         bytes calldata rawBurnTx,
         uint64 stampValue,
@@ -645,9 +716,15 @@ contract BridgeLock {
         bytes calldata rawHeader
     ) external {
         bytes32 burnTxid = sha256(abi.encodePacked(sha256(rawBurnTx)));
-        if (redeemed[burnTxid]) revert AlreadyRedeemed();
 
         EcashTx.Tx memory parsedTx = EcashTx.parse(rawBurnTx);
+
+        // The stamp input's own outpoint is this function's real single-use nonce --
+        // see stampUtxoConsumedBy's own doc comment for why a burnTxid-keyed mapping
+        // isn't sufficient (ECDSA signature malleability defeats it).
+        bytes32 stampKey =
+            keccak256(abi.encodePacked(parsedTx.inputs[1].prevoutHash, parsedTx.inputs[1].prevoutIndex));
+        if (stampUtxoConsumedBy[stampKey] != bytes32(0)) revert UtxoAlreadyUsed();
 
         (bytes32 tokenId, uint64 burnQuantity, bytes32 assetId) = _parseBurnOpReturn(parsedTx.outputs[0].script);
         if (assetId != bytes32(bytes20(address(this)))) revert WrongAsset();
@@ -661,7 +738,7 @@ contract BridgeLock {
         bytes32 root = Difficulty.headerMerkleRoot(rawHeader);
         if (!MerkleProof.verify(burnTxid, merkleBranch, merkleIndex, root)) revert InvalidMerkleProof();
 
-        redeemed[burnTxid] = true;
+        stampUtxoConsumedBy[stampKey] = burnTxid;
 
         // burnQuantity is already XEC-side (xecDecimals) units; convert back to
         // token's own decimals -- the symmetric inverse of confirmDeposit(). If XEC
@@ -677,11 +754,10 @@ contract BridgeLock {
             uint256 net = uint256(burnQuantity) - feeAmountXec;
             releaseAmount = net / scale;
             // A burn just above feeAmountXec but still smaller than feeAmountXec +
-            // scale floors to releaseAmount == 0 here -- the burner's already-
-            // irreversible eCash-side burn would otherwise be marked redeemed
-            // (above) and pay out nothing (audit finding, 2026-07 review).
-            // Reverting unwinds that write too, since nothing here has externally
-            // executed yet.
+            // scale floors to releaseAmount == 0 here -- the stamp UTXO would
+            // otherwise be marked consumed (above) for a burn that pays out nothing
+            // (audit finding, 2026-07 review). Reverting unwinds that write too,
+            // since nothing here has externally executed yet.
             if (releaseAmount == 0) revert AmountTooSmall();
             uint256 dust = pendingXecDust + (net % scale);
             if (dust >= scale) {

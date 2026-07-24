@@ -7,19 +7,12 @@ const { buildGenesis } = require('./helpers/genesis')
 //   #5 deposit()/refund() trusted the caller-supplied `amount` rather than this
 //      contract's own measured token balance delta
 
-function bytes8FromAscii(str) {
-  const buf = Buffer.alloc(8)
-  Buffer.from(str, 'ascii').copy(buf)
-  return '0x' + buf.toString('hex')
-}
-
 describe('BridgeLock audit fixes (#3, #5)', function () {
   const tokenDecimals = 6
   const xecDecimals = 9
   const feeAmount = 1_000n
   const minConfirmations = 3
   const refundDelay = 20
-  const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1)
   const { rawTx: rawGenesisTx } = buildGenesis({ decimals: xecDecimals })
 
@@ -38,7 +31,6 @@ describe('BridgeLock audit fixes (#3, #5)', function () {
           ethers.constants.AddressZero,
           feeAmount,
           minConfirmations,
-          xecNetworkId,
           minDifficultyTarget,
           refundDelay
         )
@@ -59,7 +51,6 @@ describe('BridgeLock audit fixes (#3, #5)', function () {
         authorizerWallet.address,
         feeAmount,
         minConfirmations,
-        xecNetworkId,
         minDifficultyTarget,
         refundDelay
       )
@@ -89,7 +80,6 @@ describe('BridgeLock audit fixes (#3, #5)', function () {
         authorizerWallet.address,
         feeAmount,
         minConfirmations,
-        xecNetworkId,
         minDifficultyTarget,
         refundDelay
       )

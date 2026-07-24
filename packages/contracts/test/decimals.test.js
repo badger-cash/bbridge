@@ -26,12 +26,6 @@ const { signAuthorization } = require('./helpers/authorization')
 // dust (see release.test.js's "with a <9-decimal token" describe block for that path
 // exercised end-to-end through real signed burn transactions).
 
-function bytes8FromAscii(str) {
-  const buf = Buffer.alloc(8)
-  Buffer.from(str, 'ascii').copy(buf)
-  return '0x' + buf.toString('hex')
-}
-
 function randomBytes32() {
   return '0x' + crypto.randomBytes(32).toString('hex')
 }
@@ -48,7 +42,6 @@ function randomUtxo() {
 describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
   const minConfirmations = 3
   const refundDelay = 20
-  const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1)
 
   async function deployBridge({ tokenDecimals, xecDecimals = 9, feeAmount }) {
@@ -70,22 +63,22 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       authorizerWallet.address,
       feeAmount,
       minConfirmations,
-      xecNetworkId,
       minDifficultyTarget,
       refundDelay
     )
     await bridge.deployed()
+    const chainId = await bridge.chainId()
 
     await token.connect(depositor).approve(bridge.address, ethers.constants.MaxUint256)
 
-    return { token, bridge, authorizerWallet, depositor, xecTokenId }
+    return { token, bridge, authorizerWallet, depositor, xecTokenId, chainId }
   }
 
   describe('an 18-decimal token, ETH side more precise (scale = 10**9)', function () {
     const feeAmount = 50_000_000_000n // 5e10, >= scale so feeAmountXec is nonzero
 
     it('scales netAmount down to XEC (9-decimal) units at confirmation, not at deposit', async function () {
-      const { bridge, authorizerWallet, depositor, xecTokenId } = await deployBridge({ tokenDecimals: 18, feeAmount })
+      const { bridge, authorizerWallet, depositor, xecTokenId, chainId } = await deployBridge({ tokenDecimals: 18, feeAmount })
 
       const amount = ethers.utils.parseUnits('1000', 18).add(123_456_789n) // sub-scale dust baked in
       const xecRecipient = randomXecRecipient()
@@ -106,6 +99,7 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       const { utxoTxid, utxoIndex } = randomUtxo()
       const { v, r, s } = await signAuthorization(authorizerWallet, {
         depositId,
+        chainId,
         utxoTxid,
         utxoIndex,
         xecTokenId,
@@ -218,7 +212,6 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
         authorizerWallet.address,
         1, // feeAmount, far below scale -> feeAmountXec would floor to 0
         minConfirmations,
-        xecNetworkId,
         minDifficultyTarget,
         refundDelay
       )
@@ -244,7 +237,6 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
         authorizerWallet.address,
         1_000,
         minConfirmations,
-        xecNetworkId,
         minDifficultyTarget,
         refundDelay
       )
@@ -279,7 +271,6 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       authorizerWallet.address,
       1_000,
       minConfirmations,
-      xecNetworkId,
       minDifficultyTarget,
       refundDelay
     )
@@ -308,7 +299,6 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       authorizerWallet.address,
       1_000,
       minConfirmations,
-      xecNetworkId,
       minDifficultyTarget,
       refundDelay
     )
@@ -357,7 +347,7 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
     const feeAmount = 1_000n // 0.001 USDC
 
     it('deposit()/confirmDeposit() scale netAmount up exactly -- no dust on this leg', async function () {
-      const { bridge, authorizerWallet, depositor, xecTokenId } = await deployBridge({ tokenDecimals: 6, feeAmount })
+      const { bridge, authorizerWallet, depositor, xecTokenId, chainId } = await deployBridge({ tokenDecimals: 6, feeAmount })
 
       const amount = ethers.utils.parseUnits('10', 6)
       const xecRecipient = randomXecRecipient()
@@ -372,6 +362,7 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       const { utxoTxid, utxoIndex } = randomUtxo()
       const { v, r, s } = await signAuthorization(authorizerWallet, {
         depositId,
+        chainId,
         utxoTxid,
         utxoIndex,
         xecTokenId,

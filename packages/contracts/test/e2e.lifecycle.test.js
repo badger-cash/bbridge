@@ -45,7 +45,6 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
   const scale = 1000n
   const minConfirmations = 3
   const refundDelay = 20
-  const xecNetworkId = '0x' + Buffer.from('ETH').toString('hex').padEnd(16, '0')
   const minDifficultyTarget = ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString())
 
   it('moves value from an ETH depositor to an XEC recipient and back to a (different) ETH address', async function () {
@@ -84,12 +83,12 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
       authorizerWallet.address,
       feeAmount,
       minConfirmations,
-      xecNetworkId,
       minDifficultyTarget,
       refundDelay
     )
     await bridge.deployed()
     const xecTokenId = await bridge.xecTokenId()
+    const chainId = await bridge.chainId()
 
     // -- 1. Lock (overview.md `5.` step 1) --------------------------------------
     await token.connect(depositor).approve(bridge.address, depositAmount)
@@ -115,6 +114,7 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
     const { xecAmount: preConfirmXecAmount, xecRecipient: storedXecRecipient } = await bridge.getAuthorization(depositId)
     const { v, r, s } = await signAuthorization(authorizerWallet, {
       depositId,
+      chainId,
       utxoTxid,
       utxoIndex,
       xecTokenId,
@@ -166,6 +166,7 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
 
     const message = buildAuthorizationMessage(
       Buffer.from(depositId.slice(2), 'hex'),
+      BigInt(chainId.toString()),
       authUtxoTxidBuf,
       authUtxoIndex,
       tokenIdBuf,
@@ -268,7 +269,8 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
     expect(releaseEvent.args.amount).to.equal(expectedReleaseAmount)
     expect(releaseEvent.args.tokenId).to.equal(xecTokenId)
 
-    expect(await bridge.redeemed('0x' + burnTxid.toString('hex'))).to.equal(true)
+    const stampKey = ethers.utils.solidityKeccak256(['bytes32', 'uint32'], ['0x' + stampCoin.hash.toString('hex'), stampCoin.index])
+    expect(await bridge.stampUtxoConsumedBy(stampKey)).to.equal('0x' + burnTxid.toString('hex'))
     expect(await token.balanceOf(expectedEthRecipient)).to.equal(expectedReleaseAmount)
     expect(await token.balanceOf(bridge.address)).to.equal(bridgeBalanceBeforeRelease.sub(expectedReleaseAmount))
     // What remains locked in the contract is exactly both collected fees -- no value

@@ -10,23 +10,16 @@ const { signAuthorization } = require('./helpers/authorization')
 // in docs/SPEC.md III.7. See refund()'s and requestRefund()'s own doc comments in
 // BridgeLock.sol for exactly what this mechanism does and does not guarantee.
 
-function bytes8FromAscii(str) {
-  const buf = Buffer.alloc(8)
-  Buffer.from(str, 'ascii').copy(buf)
-  return '0x' + buf.toString('hex')
-}
-
 describe('BridgeLock requestRefund() / cancelRefundRequest() / refundDelay', function () {
   const tokenDecimals = 6
   const xecDecimals = 9
   const feeAmount = 1_000n
   const minConfirmations = 3
   const refundDelay = 20
-  const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1)
   const { rawTx: rawGenesisTx } = buildGenesis({ decimals: xecDecimals })
 
-  let token, bridge, authorizerWallet, depositor, other
+  let token, bridge, authorizerWallet, depositor, other, chainId
 
   beforeEach(async function () {
     ;[depositor, other] = await ethers.getSigners()
@@ -45,11 +38,11 @@ describe('BridgeLock requestRefund() / cancelRefundRequest() / refundDelay', fun
       authorizerWallet.address,
       feeAmount,
       minConfirmations,
-      xecNetworkId,
       minDifficultyTarget,
       refundDelay
     )
     await bridge.deployed()
+    chainId = await bridge.chainId()
     await token.connect(depositor).approve(bridge.address, ethers.constants.MaxUint256)
   })
 
@@ -114,6 +107,7 @@ describe('BridgeLock requestRefund() / cancelRefundRequest() / refundDelay', fun
     const utxoTxid = '0x' + crypto.randomBytes(32).toString('hex')
     const { v, r, s } = await signAuthorization(authorizerWallet, {
       depositId,
+      chainId,
       utxoTxid,
       utxoIndex: 0,
       xecTokenId,

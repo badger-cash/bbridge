@@ -24,6 +24,7 @@ interface Scenario {
   xecAmount: number
   xecRecipientHash160: Buffer
   depositId: Buffer
+  chainId: bigint
   utxoTxid: Buffer
   utxoIndex: number
 }
@@ -36,6 +37,7 @@ function buildScenario(): Scenario {
   const xecAmount = 123_456
   const xecRecipientHash160 = crypto.randomBytes(20)
   const depositId = crypto.randomBytes(32)
+  const chainId = 1n
   const utxoTxid = crypto.randomBytes(32)
   const utxoIndex = 0
 
@@ -84,13 +86,14 @@ function buildScenario(): Scenario {
     xecAmount,
     xecRecipientHash160,
     depositId,
+    chainId,
     utxoTxid,
     utxoIndex
   }
 }
 
 function signAuthorization(s: Scenario, authorizerKeyring = s.authorizer): { message: Buffer; authSig: Buffer } {
-  const message = buildAuthorizationMessage(s.depositId, s.utxoTxid, s.utxoIndex, s.tokenId, s.xecAmount, s.xecRecipientHash160)
+  const message = buildAuthorizationMessage(s.depositId, s.chainId, s.utxoTxid, s.utxoIndex, s.tokenId, s.xecAmount, s.xecRecipientHash160)
   const authSig = signDER(hash256(message), authorizerKeyring.privateKey)
   return { message, authSig }
 }
@@ -115,14 +118,14 @@ test('mintCovenantV2 rejects an authorization signed by a key other than the Aut
 
 test('mintCovenantV2 rejects a message authorizing a different utxoIndex than the coin actually being spent', () => {
   const s = buildScenario()
-  const wrongIndexMessage = buildAuthorizationMessage(s.depositId, s.utxoTxid, s.utxoIndex + 1, s.tokenId, s.xecAmount, s.xecRecipientHash160)
+  const wrongIndexMessage = buildAuthorizationMessage(s.depositId, s.chainId, s.utxoTxid, s.utxoIndex + 1, s.tokenId, s.xecAmount, s.xecRecipientHash160)
   const authSig = signDER(hash256(wrongIndexMessage), s.authorizer.privateKey)
   assert.throws(() => run(s, wrongIndexMessage, authSig), /equalverify failed/)
 })
 
 test('mintCovenantV2 rejects a message authorizing a different xecAmount than the real mint output actually pays', () => {
   const s = buildScenario()
-  const wrongAmountMessage = buildAuthorizationMessage(s.depositId, s.utxoTxid, s.utxoIndex, s.tokenId, s.xecAmount + 1, s.xecRecipientHash160)
+  const wrongAmountMessage = buildAuthorizationMessage(s.depositId, s.chainId, s.utxoTxid, s.utxoIndex, s.tokenId, s.xecAmount + 1, s.xecRecipientHash160)
   const authSig = signDER(hash256(wrongAmountMessage), s.authorizer.privateKey)
   assert.throws(() => run(s, wrongAmountMessage, authSig), /equalverify failed/)
 })
@@ -131,6 +134,7 @@ test('mintCovenantV2 rejects a message authorizing a different recipient than th
   const s = buildScenario()
   const wrongRecipientMessage = buildAuthorizationMessage(
     s.depositId,
+    s.chainId,
     s.utxoTxid,
     s.utxoIndex,
     s.tokenId,
@@ -144,6 +148,17 @@ test('mintCovenantV2 rejects a message authorizing a different recipient than th
 test('mintCovenantV2 tolerates any depositId -- it is opaque, dropped, never checked', () => {
   const s = buildScenario()
   s.depositId = crypto.randomBytes(32) // different depositId, everything else identical
+  const { message, authSig } = signAuthorization(s)
+  assert.equal(run(s, message, authSig), true)
+})
+
+test('mintCovenantV2 tolerates any chainId -- it is opaque, dropped, never checked (2026-07 review)', () => {
+  // chainId's protective value is entirely on the Ethereum side (stops one
+  // BridgeLock deployment's signature from verifying against another's digest,
+  // see BridgeLock.sol's chainId doc comment) -- the covenant itself has no chain
+  // concept to check it against, exactly like depositId above.
+  const s = buildScenario()
+  s.chainId = 999999n // different chainId, everything else identical
   const { message, authSig } = signAuthorization(s)
   assert.equal(run(s, message, authSig), true)
 })
