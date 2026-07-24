@@ -86,6 +86,24 @@ describe('BridgeLock', function () {
     expect(stored.refunded).to.equal(false)
   })
 
+  it('records Deposit.blockNumber as a uint64, not uint32 (2026-07 review, truncation fix)', async function () {
+    // uint32(block.number) would silently wrap once block.number exceeds 2**32-1,
+    // permanently defeating confirmDeposit()'s minConfirmations wait for every
+    // deposit made after the wrap -- unreachable to actually mine to in a test, so
+    // this checks the fix at the type level (the field this contract stores
+    // block.number in is wide enough not to matter on any plausible chain) and that
+    // a real deposit's stored value still matches the block it was actually made in.
+    const depositFragment = bridge.interface.getFunction('deposits')
+    const blockNumberOutput = depositFragment.outputs.find((o) => o.name === 'blockNumber')
+    expect(blockNumberOutput.type).to.equal('uint64')
+
+    const tx = await bridge.connect(depositor).deposit(ethers.utils.parseUnits('10', 6), randomXecRecipient())
+    const receipt = await tx.wait()
+    const depositId = receipt.events.find((e) => e.event === 'DepositLocked').args.depositId
+
+    expect((await bridge.deposits(depositId)).blockNumber).to.equal(receipt.blockNumber)
+  })
+
   it('rejects a deposit at or below the fixed fee', async function () {
     await expect(bridge.connect(depositor).deposit(feeAmount, randomXecRecipient())).to.be.revertedWithCustomError(
       bridge,

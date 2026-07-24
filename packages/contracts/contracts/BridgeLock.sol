@@ -47,7 +47,16 @@ contract BridgeLock is ReentrancyGuard {
         address depositor;
         uint96 netAmount; // full-precision token base units (this contract's own decimals), after feeAmount
         bytes20 xecRecipient; // HASH160 of the recipient's XEC pubkey
-        uint32 blockNumber;
+        // uint64, not uint32 (2026-07 review): uint32(block.number) would silently
+        // wrap once block.number exceeds 2**32-1 (~1634 years on 12s-block Ethereum
+        // L1, but this contract and its docs never restrict deployment to L1), and a
+        // wrapped-to-near-zero blockNumber would defeat confirmDeposit()'s
+        // minConfirmations wait for every deposit made after the wrap, permanently
+        // (this contract is immutable). uint64 pushes that ceiling far enough out to
+        // not matter on any plausible chain, and still packs into this struct's
+        // second 32-byte storage slot alongside xecRecipient/confirmed/refunded
+        // (20 + 8 + 1 + 1 = 30 bytes) at no extra storage cost.
+        uint64 blockNumber;
         bool confirmed;
         bool refunded;
     }
@@ -360,7 +369,7 @@ contract BridgeLock is ReentrancyGuard {
             depositor: msg.sender,
             netAmount: netAmount,
             xecRecipient: xecRecipient,
-            blockNumber: uint32(block.number),
+            blockNumber: uint64(block.number),
             confirmed: false,
             refunded: false
         });
