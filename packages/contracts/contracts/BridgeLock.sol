@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {MerkleProof} from "./lib/MerkleProof.sol";
 import {Difficulty} from "./lib/Difficulty.sol";
 import {EcashTx} from "./lib/EcashTx.sol";
@@ -17,7 +18,21 @@ import {Sighash} from "./lib/Sighash.sol";
 /// Immutable and non-upgradable by design (invariant 4, contracts-spec.md `3.`):
 /// there is no owner, no admin role, and no setter anywhere in this contract. Every
 /// parameter in `3.` below is fixed at construction.
-contract BridgeLock {
+///
+/// `nonReentrant` on every fund-moving function (2026-07 review): `deposit()`'s
+/// balance-delta accounting (measuring `token.balanceOf` before and after
+/// `safeTransferFrom`, added for fee-on-transfer correctness -- see that function's
+/// own doc comment) reads its "before" snapshot, then makes an external call, then
+/// reads its "after" balance. If `token` were ever a hook-bearing asset (an
+/// ERC-777-style token, or any ERC-20 whose `transferFrom` can hand control back to
+/// the caller before updating balances), a reentrant nested `deposit()` call could
+/// complete its own transfer inside that window, causing the outer call's delta to
+/// double-count the inner transfer and mint excess `netAmount` credit refundable out
+/// of other depositors' funds. `token` is an immutable, deployer-chosen address in
+/// this design (never arbitrary per-call input), so this guard is defense-in-depth
+/// against an unexpected token choice, not a response to an attacker-reachable path
+/// in the current deployment model.
+contract BridgeLock is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     /// @dev Standard SLP dust value for a token-carrying output. Used both for the
@@ -329,7 +344,7 @@ contract BridgeLock {
     /// depositors' expense. Measuring the real delta means `netAmount` can never
     /// exceed what this deposit actually contributed, so there is nothing left to
     /// extract this way regardless of `token`'s transfer semantics.
-    function deposit(uint256 amount, bytes20 xecRecipient) external returns (bytes32 depositId) {
+    function deposit(uint256 amount, bytes20 xecRecipient) external nonReentrant returns (bytes32 depositId) {
         uint256 balanceBefore = token.balanceOf(address(this));
         token.safeTransferFrom(msg.sender, address(this), amount);
         uint256 received = token.balanceOf(address(this)) - balanceBefore;
@@ -416,7 +431,7 @@ contract BridgeLock {
     /// -- this delay is additional friction against the race, not a substitute for
     /// quarantine. Do not treat a passing refundDelay as proof no valid signature is
     /// outstanding.
-    function refund(bytes32 depositId) external {
+    function refund(bytes32 depositId) external nonReentrant {
         Deposit storage d = deposits[depositId];
         if (d.depositor == address(0)) revert UnknownDeposit();
         if (d.confirmed) revert AlreadyConfirmed();
@@ -472,7 +487,7 @@ contract BridgeLock {
     /// already live, which served no purpose once the depositor has signaled intent
     /// to exit and only widened the window during which both an ETH-side refund and
     /// an XEC-side mint could complete against the same collateral.
-    function confirmDeposit(bytes32 depositId, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s) external {
+    function confirmDeposit(bytes32 depositId, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s) external nonReentrant {
         Deposit storage d = deposits[depositId];
         if (d.depositor == address(0)) revert UnknownDeposit();
         if (d.confirmed) revert AlreadyConfirmed();
@@ -744,7 +759,7 @@ contract BridgeLock {
         bytes32[] calldata merkleBranch,
         uint256 merkleIndex,
         bytes calldata rawHeader
-    ) external {
+    ) external nonReentrant {
         bytes32 burnTxid = sha256(abi.encodePacked(sha256(rawBurnTx)));
 
         EcashTx.Tx memory parsedTx = EcashTx.parse(rawBurnTx);
