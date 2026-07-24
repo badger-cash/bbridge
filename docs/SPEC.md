@@ -3,7 +3,7 @@
 # bbridge Protocol Specification
 
 ### Specification version: 0.2
-### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 76 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
+### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 77 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
 
 # Table of Contents
 

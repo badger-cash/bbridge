@@ -66,6 +66,16 @@ describe('BridgeLock zero-floor fixes', function () {
       await expect(bridge.getAuthorization(depositId)).to.be.revertedWithCustomError(bridge, 'AmountTooSmall')
     })
 
+    it('reverts getAuthorization() with UnknownDeposit, not AmountTooSmall, for a depositId that was never created (2026-07 review, round 4)', async function () {
+      // Before this fix, a bogus depositId (netAmount defaulting to 0) and the real,
+      // legitimately dust-locked deposit above were indistinguishable -- both reverted
+      // AmountTooSmall, contradicting this function's own doc comment claiming it
+      // mirrors confirmDeposit() (which does check depositor != address(0)).
+      const bogusDepositId = '0x' + crypto.randomBytes(32).toString('hex')
+
+      await expect(bridge.getAuthorization(bogusDepositId)).to.be.revertedWithCustomError(bridge, 'UnknownDeposit')
+    })
+
     it('reverts before mutating any state, leaving refund() open', async function () {
       const tx = await bridge.connect(depositor).deposit(500, '0x' + '11'.repeat(20))
       const depositId = (await tx.wait()).events.find((e) => e.event === 'DepositLocked').args.depositId

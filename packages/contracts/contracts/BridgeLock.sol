@@ -620,6 +620,14 @@ contract BridgeLock is ReentrancyGuard {
     /// such a deposit can never actually be confirmed, so this mirrors that instead
     /// of silently truncating and returning a value that doesn't correspond to
     /// anything confirmDeposit() could ever produce.
+    ///
+    /// `UnknownDeposit` check (2026-07 review, round 4): every other depositId-keyed
+    /// function (confirmDeposit, refund, requestRefund, cancelRefundRequest) reverts
+    /// UnknownDeposit for a depositId that was never created. This function used to
+    /// skip straight to the AmountTooSmall check above, which a nonexistent deposit
+    /// (netAmount defaulting to 0) also produces -- indistinguishable from a real,
+    /// legitimately dust-locked deposit, contradicting the "mirrors confirmDeposit()"
+    /// framing this doc comment already claims.
     function getAuthorization(bytes32 depositId)
         external
         view
@@ -635,6 +643,7 @@ contract BridgeLock is ReentrancyGuard {
         )
     {
         Deposit storage d = deposits[depositId];
+        if (d.depositor == address(0)) revert UnknownDeposit();
         Authorization storage a = _authorizations[depositId];
         uint256 amount = xecHasMorePrecision ? uint256(d.netAmount) * scale : uint256(d.netAmount) / scale;
         if (amount > type(uint64).max) revert AmountTooLarge();
