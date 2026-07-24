@@ -120,6 +120,49 @@ describe('BridgeLock requestRefund() / cancelRefundRequest() / refundDelay', fun
     await expect(bridge.connect(depositor).requestRefund(depositId)).to.be.revertedWithCustomError(bridge, 'AlreadyConfirmed')
   })
 
+  it('rejects confirmDeposit() once a refund request is live, even with a valid signature (2026-07 review, confirm/refund race narrowing)', async function () {
+    const depositId = await makeDeposit(ethers.utils.parseUnits('1000', 6))
+    const xecTokenId = await bridge.xecTokenId()
+    const { xecAmount, xecRecipient } = await bridge.getAuthorization(depositId)
+    const utxoTxid = '0x' + crypto.randomBytes(32).toString('hex')
+    const { v, r, s } = await signAuthorization(authorizerWallet, {
+      depositId,
+      chainId,
+      utxoTxid,
+      utxoIndex: 0,
+      xecTokenId,
+      xecAmount,
+      xecRecipient
+    })
+
+    await bridge.connect(depositor).requestRefund(depositId)
+    for (let i = 0; i < minConfirmations; i++) await ethers.provider.send('evm_mine')
+
+    await expect(bridge.confirmDeposit(depositId, utxoTxid, 0, v, r, s)).to.be.revertedWithCustomError(bridge, 'RefundRequestPending')
+  })
+
+  it('allows confirmDeposit() again once a live refund request is cancelled', async function () {
+    const depositId = await makeDeposit(ethers.utils.parseUnits('1000', 6))
+    const xecTokenId = await bridge.xecTokenId()
+    const { xecAmount, xecRecipient } = await bridge.getAuthorization(depositId)
+    const utxoTxid = '0x' + crypto.randomBytes(32).toString('hex')
+    const { v, r, s } = await signAuthorization(authorizerWallet, {
+      depositId,
+      chainId,
+      utxoTxid,
+      utxoIndex: 0,
+      xecTokenId,
+      xecAmount,
+      xecRecipient
+    })
+
+    await bridge.connect(depositor).requestRefund(depositId)
+    await bridge.connect(depositor).cancelRefundRequest(depositId)
+    for (let i = 0; i < minConfirmations; i++) await ethers.provider.send('evm_mine')
+
+    await expect(bridge.confirmDeposit(depositId, utxoTxid, 0, v, r, s)).to.emit(bridge, 'DepositConfirmed')
+  })
+
   it('a second requestRefund() call restarts the cooldown from the current block', async function () {
     const depositId = await makeDeposit(ethers.utils.parseUnits('10', 6))
 

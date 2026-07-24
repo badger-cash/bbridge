@@ -256,6 +256,7 @@ contract BridgeLock {
     error RefundNotRequested();
     error RefundDelayNotElapsed();
     error RecipientMismatch();
+    error RefundRequestPending();
 
     constructor(
         IERC20 token_,
@@ -462,11 +463,21 @@ contract BridgeLock {
     /// spendable on XEC before observing this exact call reach Ethereum finality
     /// (vault UTXO quarantine, `docs/SPEC.md` `III.7`). This is a hard requirement on
     /// the Authorizer service's implementation, not a suggestion.
+    ///
+    /// `refundRequestedAt` check (2026-07 review): narrows, but does not close, the
+    /// race described above. A signature broadcast *before* requestRefund() was ever
+    /// called remains independently valid regardless of this check -- see refund()'s
+    /// own doc comment. What this closes is the narrower on-chain race where
+    /// confirmDeposit() would otherwise still succeed *after* a refund request is
+    /// already live, which served no purpose once the depositor has signaled intent
+    /// to exit and only widened the window during which both an ETH-side refund and
+    /// an XEC-side mint could complete against the same collateral.
     function confirmDeposit(bytes32 depositId, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s) external {
         Deposit storage d = deposits[depositId];
         if (d.depositor == address(0)) revert UnknownDeposit();
         if (d.confirmed) revert AlreadyConfirmed();
         if (d.refunded) revert AlreadyRefunded();
+        if (refundRequestedAt[depositId] != 0) revert RefundRequestPending();
         if (block.number < uint256(d.blockNumber) + minConfirmations) revert TooEarlyToConfirm();
         bytes32 utxoKey = keccak256(abi.encodePacked(utxoTxid, utxoIndex));
         if (utxoConsumedBy[utxoKey] != bytes32(0)) revert UtxoAlreadyUsed();
