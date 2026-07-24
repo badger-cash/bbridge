@@ -12,8 +12,17 @@ const { Hash160 } = bcrypto
 /// BridgeLock.release() expects (overview.md `6.`), using the underlying eCash
 /// primitives directly since packages/sdk doesn't have a burn/postage builder
 /// yet (overview.md `9.`, "No burn/postage transaction builder exists yet").
-function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQuantity, stampSighashType, stampCoinOverride }) {
-  const burner = KeyRing.fromPrivate(crypto.randomBytes(32), true)
+function buildSignedBurnTx({
+  authorizerPrivateKey,
+  bridgeAddress,
+  tokenId,
+  burnQuantity,
+  stampSighashType,
+  stampCoinOverride,
+  burnerOverride,
+  recipientHash160Override
+}) {
+  const burner = burnerOverride ?? KeyRing.fromPrivate(crypto.randomBytes(32), true)
   const authorizer = KeyRing.fromPrivate(Buffer.from(authorizerPrivateKey.replace(/^0x/, ''), 'hex'), true)
 
   const burnerPubkey = burner.getPublicKey()
@@ -30,6 +39,14 @@ function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQ
   const stampCoin = stampCoinOverride ?? new Coin({ hash: crypto.randomBytes(32), index: 0, value: stampValue, script: authorizerScript })
 
   const assetId = Buffer.concat([Buffer.from(bridgeAddress.replace(/^0x/, ''), 'hex'), Buffer.alloc(12)])
+  // Authorizer-attested recipient (2026-07 review, recipient-authentication-bypass
+  // fix): defaults to the real burner's own hash160, matching what a real postage
+  // service would attest to after verifying input 0's actual previous output.
+  // recipientHash160Override lets a test assert this against something else -- either
+  // a wrong value (proving the mismatch check fires) or the real burner's hash160
+  // even though input 0 is signed by a different key (proving an attacker can't just
+  // swap the signing key and keep the original attestation).
+  const recipientHash160 = recipientHash160Override ?? Hash160.digest(burnerPubkey)
 
   const opReturn = new Script()
     .pushSym('return')
@@ -39,6 +56,7 @@ function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQ
     .pushData(tokenId)
     .pushData(u64be(burnQuantity))
     .pushData(assetId)
+    .pushData(recipientHash160)
     .compile()
 
   const tx = new PreimageMTX()
@@ -67,7 +85,7 @@ function buildSignedBurnTx({ authorizerPrivateKey, bridgeAddress, tokenId, burnQ
 
   tx.check(flags) // real eCash script verification, same as packages/sdk's own tests
 
-  return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, stampCoin }
+  return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, stampCoin, burner }
 }
 
 // Mirrors BridgeLock.sol's `keccak256(abi.encodePacked(prevoutHash, prevoutIndex))` for
@@ -259,6 +277,52 @@ describe('BridgeLock.release()', function () {
     await expect(
       bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'WrongTokenId')
+  })
+
+  it('rejects a burn whose OP_RETURN-attested recipient is simply wrong', async function () {
+    const { rawTx, txid, stampValue } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity,
+      recipientHash160Override: crypto.randomBytes(20)
+    })
+    const header = mineSingleTxHeader(txid)
+
+    await expect(
+      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+    ).to.be.revertedWithCustomError(bridge, 'RecipientMismatch')
+  })
+
+  it('rejects a forged burn input signed by a different key than the OP_RETURN-attested recipient (2026-07 review, recipient-authentication-bypass fix)', async function () {
+    // Simulates the vulnerability this closes: an attacker takes an already-stamped
+    // burn's fixed declaration (same OP_RETURN, including its Authorizer-attested
+    // recipient -- covered by the stamp's own hashOutputs commitment) and substitutes
+    // input 0's signature for one under their own freshly-generated key, hoping to
+    // redirect the payout to themselves. The stamp signature (input 1, SIGHASH_ALL,
+    // no ANYONECANPAY) never covers input 0's scriptSig bytes -- only its outpoint --
+    // so it stays valid regardless of who signs input 0. Before this fix,
+    // _verifyBurnInput only checked that *some* key signed input 0 self-consistently
+    // and paid out to whatever address that key derived to; it never checked that key
+    // against anything the Authorizer actually vetted, so this would have paid the
+    // attacker. Now the attacker's key's hash160 doesn't match the OP_RETURN's
+    // attested recipientHash160 (still the real burner's), so release() reverts.
+    const realBurner = KeyRing.fromPrivate(crypto.randomBytes(32), true)
+    const attacker = KeyRing.fromPrivate(crypto.randomBytes(32), true)
+
+    const { rawTx, txid, stampValue } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity,
+      burnerOverride: attacker,
+      recipientHash160Override: Hash160.digest(realBurner.getPublicKey())
+    })
+    const header = mineSingleTxHeader(txid)
+
+    await expect(
+      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+    ).to.be.revertedWithCustomError(bridge, 'RecipientMismatch')
   })
 })
 

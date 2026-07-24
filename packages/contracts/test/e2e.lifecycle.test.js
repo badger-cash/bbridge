@@ -211,6 +211,7 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
       .pushData(tokenIdBuf)
       .pushData(u64be(BigInt(xecAmountNum)))
       .pushData(assetId)
+      .pushData(xecRecipientBuf) // 2026-07 review: Authorizer-attested recipient hash160
       .compile()
 
     const burnTx = new PreimageMTX()

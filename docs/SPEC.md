@@ -3,7 +3,7 @@
 # bbridge Protocol Specification
 
 ### Specification version: 0.2
-### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 64 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
+### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 35 passing cases; `packages/contracts`: 66 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
 
 # Table of Contents
 
@@ -212,7 +212,7 @@ The contract, on receipt:
 1. Parses the transaction and its OP_RETURN.
 2. Verifies `assetId` (Section V) equals the contract's own address.
 3. Verifies the user's signature on the burn input and the Authorizer's signature on the postage input, the latter against the Authorizer's known key.
-4. Derives the release recipient (Section IV.4).
+4. Derives the release recipient and cross-checks it against the OP_RETURN's own attested recipient (Section IV.4).
 5. Verifies the supplied header is self-consistent with its own claimed difficulty and clears the deployment's minimum difficulty floor (Section IV.5).
 6. Verifies the Merkle path resolves the transaction to the supplied header's merkle root.
 7. Releases the burned quantity, net of the fixed withdrawal fee, to the derived recipient, and records the postage input's own outpoint as consumed to prevent a second release referencing the same stamp coin.
@@ -227,7 +227,9 @@ The release recipient is derived cryptographically from the public key present i
 ethRecipient = last 20 bytes of Keccak256(uncompressed_pubkey[1:])
 ```
 
-The recipient is never a caller-supplied parameter. Because burn transactions are public on XEC prior to any Ethereum-side claim, a caller-supplied recipient would allow any party observing the XEC mempool to front-run the legitimate burner's claim with their own address. Deriving the recipient from the burn's own signing key removes this class of attack entirely: whoever submits the release call, and whatever address they might prefer, is immaterial to where funds are sent.
+The recipient is never a `release()`-call argument. Because burn transactions are public on XEC prior to any Ethereum-side claim, a `release()`-caller-supplied recipient would allow any party observing the XEC mempool (or the pending Ethereum call itself) to front-run the legitimate burner's claim with their own address. Deriving the recipient from the burn's own signing key means whoever submits the release call, and whatever address they might prefer, is immaterial to where funds are sent — *if* that signing key is genuinely the burned coin's own owner.
+
+**Cross-check against the OP_RETURN's attested recipient (2026-07 review, recipient-authentication-bypass fix).** Deriving the recipient purely from input 0's signing key only proves *some* key produced a self-consistent signature — this contract has no way to look up input 0's real previous output, so on its own it cannot verify that key is actually the burned coin's real owner. Because the Authorizer's own postage signature (Section IV.2, `SIGHASH_ALL`, no `ANYONECANPAY`) commits to every output's content (`hashOutputs`) but never to input 0's `scriptSig` bytes, an attacker who observed an already-postaged burn (which every legitimate burn is, well before any Ethereum-side claim) could previously substitute input 0's signature for one under their own freshly-generated key — leaving input 0's outpoint, and therefore the postage signature's own validity, untouched — and redirect the release to themselves. Closed by adding a `recipientHash160` field to the BURN OP_RETURN (Section V) and requiring, on release, that the `hash160` of whichever key actually signed input 0 equals this field. Because the OP_RETURN sits in output 0, both the burner's own signature and the Authorizer's postage signature already commit to it (`hashOutputs`) — so an attacker substituting a different signing key on input 0 cannot also change the attested recipient without invalidating the postage signature they cannot forge. A real burner, honestly constructing their own transaction, naturally sets this field to their own `hash160`, so this check never affects a legitimate burn.
 
 ## 5. Proof-of-Work Floor
 
@@ -275,10 +277,13 @@ A bridge-specific variant of the standard SLP Type 2 BURN format:
 | 4 | 32 | `token_id` |
 | 5 | 8 | Burn quantity, big-endian |
 | 6 | 32 | `assetId` |
+| 7 | 20 | `recipientHash160` |
 
 `token_id` (push 4) *is* verified against `xecTokenId` (`WrongTokenId` if it doesn't match) — but `xecTokenId` is not a separately hand-typed constant the way an earlier draft of this contract used. It is derived, once, at construction, as the HASH256 of the raw GENESIS transaction bytes the deployer supplies (Section II) — by SLP convention, a token's `token_id` *is* the HASH256 of its own GENESIS transaction, so this value cannot independently drift from the token actually deployed on XEC the way a hand-typed constant could. This is a narrower guarantee than full SLP validity: it does not trace token lineage back through the transaction graph the way a real indexer would, and it doesn't need to — the Authorizer's decision to co-sign the postage input (Section IV.2) remains the operative attestation that a burn represents the *correct* wrapped token in the presumably-indexed sense; this check only additionally rules out a mismatch against what this specific deployment was actually genesis'd with.
 
 `assetId` (push 6) *is* independently verified (Section IV.3.2), against the releasing contract's own address. This is a distinct kind of check from `token_id`: a trivial, self-referential domain separator requiring no external data or trust, present to scope a burn to the correct bridge deployment even under a fully honest Authorizer (for example, one Authorizer key backing multiple deployments).
+
+`recipientHash160` (push 7, 2026-07 review) *is* independently verified (Section IV.4) against the `hash160` of whichever key actually signed input 0. See Section IV.4's own note for the full reasoning — in short, this field closes a gap where the release recipient was derivable from any self-consistent signature on input 0, with no check that the signing key was actually the burned coin's real owner.
 
 ### Merkle proofs
 

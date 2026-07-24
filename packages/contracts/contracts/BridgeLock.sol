@@ -255,6 +255,7 @@ contract BridgeLock {
     error ZeroAuthorizer();
     error RefundNotRequested();
     error RefundDelayNotElapsed();
+    error RecipientMismatch();
 
     constructor(
         IERC20 token_,
@@ -708,6 +709,24 @@ contract BridgeLock {
     /// `stampUtxoConsumedBy`'s own doc comment) rather than on `burnTxid`: the
     /// outpoint is invariant under any re-encoding, so it closes the replay
     /// regardless of which header or which byte-encoding a resubmission uses.
+    ///
+    /// RECIPIENT-AUTHENTICATION BYPASS (2026-07 review): the outpoint-keyed tracking
+    /// above stops a *known-good* burn from being replayed under a re-encoded
+    /// signature, but on its own said nothing about *who* input 0's signature had to
+    /// belong to. The stamp's own SIGHASH_ALL commitment (input 1, no ANYONECANPAY)
+    /// covers every input's prevout (hashPrevouts/hashSequence) but never any input's
+    /// scriptSig bytes -- so swapping input 0's scriptSig for a signature under an
+    /// attacker's own freshly-generated key, while leaving input 0's outpoint
+    /// untouched, left the stamp signature on input 1 fully valid. Combined with the
+    /// weak-header capability above (self-mine a throwaway header for the modified
+    /// transaction), anyone who observed an already-stamped burn -- which every
+    /// legitimate burn is, well before release() is ever called -- could front-run
+    /// the real burner and redirect the payout to themselves, since _verifyBurnInput
+    /// never checked the signing key against anything but itself. Closed by binding
+    /// the burn OP_RETURN's Authorizer-attested `recipientHash160` (which the stamp's
+    /// hashOutputs commitment does cover) to the hash160 of whichever key actually
+    /// signed input 0 -- see `_parseBurnOpReturn` and `_verifyBurnInput`'s own doc
+    /// comments.
     function release(
         bytes calldata rawBurnTx,
         uint64 stampValue,
@@ -726,12 +745,14 @@ contract BridgeLock {
             keccak256(abi.encodePacked(parsedTx.inputs[1].prevoutHash, parsedTx.inputs[1].prevoutIndex));
         if (stampUtxoConsumedBy[stampKey] != bytes32(0)) revert UtxoAlreadyUsed();
 
-        (bytes32 tokenId, uint64 burnQuantity, bytes32 assetId) = _parseBurnOpReturn(parsedTx.outputs[0].script);
+        (bytes32 tokenId, uint64 burnQuantity, bytes32 assetId, bytes20 recipientHash160) =
+            _parseBurnOpReturn(parsedTx.outputs[0].script);
         if (assetId != bytes32(bytes20(address(this)))) revert WrongAsset();
         if (tokenId != xecTokenId) revert WrongTokenId();
         if (burnQuantity <= feeAmountXec) revert AmountTooSmall();
 
-        address ethRecipient = _verifyBurnInput(parsedTx);
+        (address ethRecipient, bytes20 pubkeyHash160) = _verifyBurnInput(parsedTx);
+        if (pubkeyHash160 != recipientHash160) revert RecipientMismatch();
         _verifyStampInput(parsedTx, stampValue);
 
         if (!Difficulty.meetsFloor(rawHeader, minDifficultyTarget)) revert HeaderBelowDifficultyFloor();
@@ -779,13 +800,26 @@ contract BridgeLock {
     /// @dev Verifies the burner's own signature on input 0 and derives the recipient
     /// from their pubkey (contracts-spec.md `2.2` -- not a caller-supplied address).
     /// `view`, not `pure`, because pubkey decompression calls the MODEXP precompile.
-    function _verifyBurnInput(EcashTx.Tx memory parsedTx) private view returns (address ethRecipient) {
+    ///
+    /// Also returns `pubkeyHash160` -- the hash160 of the pubkey that actually signed
+    /// input 0 -- so release() can check it against the burn OP_RETURN's
+    /// Authorizer-attested `recipientHash160` (2026-07 review). Self-consistency
+    /// alone (this function's checks below) only proves *some* keypair signed input 0
+    /// correctly; it says nothing about whether that keypair is the coin's real
+    /// owner, since this contract has no way to look up input 0's actual previous
+    /// output. The caller-side check is what closes that gap.
+    function _verifyBurnInput(EcashTx.Tx memory parsedTx)
+        private
+        view
+        returns (address ethRecipient, bytes20 pubkeyHash160)
+    {
         (bytes memory sig, bytes memory pubkey) = EcashTx.extractSigAndPubkey(parsedTx.inputs[0].scriptSig);
         (uint256 r, uint256 s, uint8 sighashType) = EcashTx.parseDER(sig);
         if (sighashType != (0x01 | 0x40 | 0x80)) revert InvalidBurnSignature();
 
         (uint256 x, uint256 y) = EcashTx.decompress(pubkey);
-        bytes memory scriptCode = EcashTx.p2pkhScriptCode(EcashTx.hash160(pubkey));
+        pubkeyHash160 = EcashTx.hash160(pubkey);
+        bytes memory scriptCode = EcashTx.p2pkhScriptCode(pubkeyHash160);
         bytes32 digest = Sighash.digest(parsedTx, 0, scriptCode, SLP_DUST_SATS, 0x01 | 0x40 | 0x80);
 
         if (!EcashTx.verifyAgainstPubkey(digest, r, s, x, y)) revert InvalidBurnSignature();
@@ -809,9 +843,10 @@ contract BridgeLock {
     }
 
     /// @dev Parses a bridge-specific variant of the standard SLP Type 2 BURN
-    /// OP_RETURN: the standard fields, plus an `assetId` field appended after them
-    /// (overview.md `6.` step 1). Exact layout is still an open question
-    /// (contracts-spec.md `8.`) -- this is one concrete proposal, not a settled spec.
+    /// OP_RETURN: the standard fields, plus `assetId` and `recipientHash160` fields
+    /// appended after them (overview.md `6.` step 1). Exact layout is still an open
+    /// question (contracts-spec.md `8.`) -- this is one concrete proposal, not a
+    /// settled spec.
     ///
     /// `tokenId` is checked against `xecTokenId` by release() (WrongTokenId). This
     /// used to be deliberately unchecked -- an earlier draft re-checked it against a
@@ -822,7 +857,24 @@ contract BridgeLock {
     /// `rawGenesisTx_` given to the constructor, not a separately-asserted value, so
     /// this check now holds independently of Authorizer honesty (see xecTokenId's own
     /// doc comment).
-    function _parseBurnOpReturn(bytes memory script) private pure returns (bytes32 tokenId, uint64 quantity, bytes32 assetId) {
+    ///
+    /// `recipientHash160` (2026-07 review, recipient-authentication-bypass finding):
+    /// the Authorizer's postage service must independently verify, before stamping,
+    /// that this field actually matches input 0's real previous output's P2PKH
+    /// hash160 -- release() then checks it against the hash160 of the pubkey that
+    /// actually signed input 0 (_verifyBurnInput). Because this field sits in output
+    /// 0, it's covered by the stamp's own SIGHASH_ALL commitment (hashOutputs), so it
+    /// can't be tampered with independently of the stamp signature. Without this,
+    /// _verifyBurnInput only checked that input 0's signature was self-consistent
+    /// with whatever pubkey the scriptSig itself carried -- never that the pubkey was
+    /// actually the real coin's owner -- so anyone who observed an already-stamped
+    /// burn could swap in their own key on input 0 (leaving its outpoint, and
+    /// therefore the stamp's own validity, untouched) and steal the release.
+    function _parseBurnOpReturn(bytes memory script)
+        private
+        pure
+        returns (bytes32 tokenId, uint64 quantity, bytes32 assetId, bytes20 recipientHash160)
+    {
         require(uint8(script[0]) == 0x6a, "EcashTx: expected OP_RETURN");
         uint256 offset = 1;
 
@@ -852,6 +904,11 @@ contract BridgeLock {
         (assetIdBytes, offset) = EcashTx.readPush(script, offset);
         require(assetIdBytes.length == 32, "BridgeLock: bad assetId length");
         assetId = _bytesToBytes32(assetIdBytes);
+
+        bytes memory recipientBytes;
+        (recipientBytes, offset) = EcashTx.readPush(script, offset);
+        require(recipientBytes.length == 20, "BridgeLock: bad recipient length");
+        recipientHash160 = bytes20(_bytesToBytes32(abi.encodePacked(recipientBytes, bytes12(0))));
     }
 
     /// @dev Walks a raw transaction just far enough to reach its first output's

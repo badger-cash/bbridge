@@ -168,6 +168,7 @@ describe('BridgeLock zero-floor fixes', function () {
         .pushData(tokenId)
         .pushData(u64be(burnQuantity))
         .pushData(assetId)
+        .pushData(Hash160.digest(burner.getPublicKey())) // 2026-07 review: Authorizer-attested recipient
         .compile()
 
       const tx = new PreimageMTX()
