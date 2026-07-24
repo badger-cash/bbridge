@@ -20,6 +20,7 @@ function buildSignedBurnTx({
   stampSighashType,
   stampCoinOverride,
   burnerOverride,
+  burnerCoinOverride,
   recipientHash160Override,
   burnInputValue
 }) {
@@ -36,7 +37,12 @@ function buildSignedBurnTx({
   // prove a burn of a coin that's since taken on a different value (ordinary SLP
   // consolidation/SEND) still releases correctly (2026-07 review,
   // hardcoded-burn-input-value fix).
-  const burnerCoin = new Coin({ hash: crypto.randomBytes(32), index: 0, value: burnInputValue ?? 546, script: burnerScript })
+  // burnerCoinOverride lets a test reuse the exact same burn input outpoint across
+  // two otherwise-independent burn transactions -- standing in for an honest
+  // Authorizer key co-signing two distinct, both-genuine stamps against the same
+  // burn declaration (2026-07 review, round 4, honest-key double-stamp fix).
+  const burnerCoin =
+    burnerCoinOverride ?? new Coin({ hash: crypto.randomBytes(32), index: 0, value: burnInputValue ?? 546, script: burnerScript })
   const stampValue = 2000
   // stampCoinOverride lets a caller reuse the exact same stamp outpoint across two
   // otherwise-independent burn transactions -- standing in for a malleated
@@ -91,7 +97,7 @@ function buildSignedBurnTx({
 
   tx.check(flags) // real eCash script verification, same as packages/sdk's own tests
 
-  return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, stampCoin, burner, burnInputValue: burnerCoin.value }
+  return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, stampCoin, burner, burnerCoin, burnInputValue: burnerCoin.value }
 }
 
 // Mirrors BridgeLock.sol's `keccak256(abi.encodePacked(prevoutHash, prevoutIndex))` for
@@ -211,6 +217,41 @@ describe('BridgeLock.release()', function () {
 
     await expect(
       bridge.release('0x' + rawTx2.toString('hex'), 546, stampValue, [], 0, '0x' + header2.toString('hex'))
+    ).to.be.revertedWithCustomError(bridge, 'UtxoAlreadyUsed')
+  })
+
+  it('rejects a second, independently-Authorizer-stamped release of the same burn declaration (2026-07 review, round 4, honest-key double-stamp fix)', async function () {
+    // Simulates an honest Authorizer key that -- via an ordinary off-chain
+    // postage-service race or retry, not a key compromise -- co-signs two distinct,
+    // both-genuine stamps against the same burn declaration (same burn input
+    // outpoint, same OP_RETURN). Before this fix, stampUtxoConsumedBy was keyed only
+    // on the stamp's own outpoint, which is fresh and unseen for the second stamp, so
+    // the second release() call would have succeeded and paid out twice.
+    const { rawTx, txid, stampValue, burner, burnerCoin } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity
+    })
+    const header = mineSingleTxHeader(txid)
+    await bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
+
+    // A second, fully independent burn transaction: same burner key, same burn coin
+    // (same outpoint), same OP_RETURN, but a fresh stamp coin -- standing in for a
+    // second genuine Authorizer co-signature over the same declaration.
+    const { rawTx: rawTx2, txid: txid2, stampValue: stampValue2 } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity,
+      burnerOverride: burner,
+      burnerCoinOverride: burnerCoin
+    })
+    expect(txid2.equals(txid)).to.equal(false)
+    const header2 = mineSingleTxHeader(txid2)
+
+    await expect(
+      bridge.release('0x' + rawTx2.toString('hex'), 546, stampValue2, [], 0, '0x' + header2.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'UtxoAlreadyUsed')
   })
 

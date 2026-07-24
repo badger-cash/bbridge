@@ -221,13 +221,32 @@ contract BridgeLock is ReentrancyGuard {
     /// the stamp input's own (non-ANYONECANPAY) SIGHASH_ALL signature additionally
     /// commits to the full, fixed input set -- so tracking it directly closes the
     /// replay regardless of which header or which byte-encoding a resubmission uses.
-    /// Verifying the burn coin's own outpoint isn't similarly duplicated here: on a
-    /// real XEC deployment that coin can only ever be spent once by chain consensus,
-    /// and the Authorizer's own postage process is the operational checkpoint
-    /// responsible for not co-signing postage against an already-spent one -- a
-    /// business-process responsibility of the Authorizer service, not something this
-    /// contract's code can or should independently re-verify.
+    /// This alone does NOT close every replay path (2026-07 review, round 4): it was
+    /// previously reasoned that the burn coin's own outpoint didn't need independent
+    /// tracking here, since a real XEC coin can only be spent once by chain consensus.
+    /// That reasoning assumed the *stamp* was release()'s scarce resource -- but an
+    /// honest Authorizer key can still, via an ordinary off-chain postage-service race
+    /// or retry (the Authorizer service isn't built yet), co-sign two distinct,
+    /// both-genuine stamps against the *same* burn declaration. Since input 0's
+    /// signature uses SIGHASH_ANYONECANPAY (valid glued to any co-input) and this
+    /// contract's header check never requires real chain-tip inclusion, a second,
+    /// independently-obtained stamp alone would be sufficient for a second full
+    /// release of the same burn -- no key compromise needed. See
+    /// `burnUtxoConsumedBy` below, which closes this the same way `utxoConsumedBy`
+    /// already does for deposits.
     mapping(bytes32 stampUtxoKey => bytes32 burnTxid) public stampUtxoConsumedBy;
+    /// @dev Closes the honest-key double-stamp gap described in stampUtxoConsumedBy's
+    /// own doc comment above (2026-07 review, round 4): tracks release()'s input 0
+    /// (the burn declaration's own coin) by its outpoint, so a single burn can back at
+    /// most one release ever, independent of how many distinct, individually-genuine
+    /// Authorizer stamps ever get produced for it. Deliberately does NOT protect
+    /// against a compromised Authorizer key -- an attacker holding that key can invent
+    /// an arbitrary fresh outpoint at zero cost (e.g. incrementing vout), exactly the
+    /// same caveat `utxoConsumedBy`'s deposit-side vault-UTXO-quarantine already has
+    /// (see docs/SPEC.md's Authorizer-requirements sections). Keyed by
+    /// keccak256(prevoutHash, prevoutIndex) of input 0, mapping to the burnTxid that
+    /// consumed it (0x0 = unused).
+    mapping(bytes32 burnUtxoKey => bytes32 burnTxid) public burnUtxoConsumedBy;
     uint256 private _depositNonce;
     /// @dev Block number of the live requestRefund() call for a given depositId, or
     /// 0 if none is outstanding. See requestRefund()/cancelRefundRequest()/refund().
@@ -773,6 +792,18 @@ contract BridgeLock is ReentrancyGuard {
     /// hashOutputs commitment does cover) to the hash160 of whichever key actually
     /// signed input 0 -- see `_parseBurnOpReturn` and `_verifyBurnInput`'s own doc
     /// comments.
+    ///
+    /// HONEST-KEY DOUBLE-STAMP (2026-07 review, round 4): the stamp-outpoint tracking
+    /// above assumes the stamp is release()'s scarce resource, but an honest
+    /// Authorizer key can still, via an ordinary off-chain postage-service race or
+    /// retry, co-sign two distinct, both-genuine stamps against the same burn
+    /// declaration -- input 0's ANYONECANPAY signature is valid glued to either one,
+    /// and this contract's header check never requires real chain-tip inclusion, so
+    /// the second stamp alone would suffice for a second release. Closed by also
+    /// tracking input 0's own outpoint (`burnUtxoConsumedBy`) -- the burn declaration
+    /// itself is the resource that can legitimately back at most one release, and an
+    /// honest postage service cannot fabricate a second one the way a compromised key
+    /// could (see `burnUtxoConsumedBy`'s own doc comment for that narrower caveat).
     function release(
         bytes calldata rawBurnTx,
         uint64 burnInputValue,
@@ -792,6 +823,12 @@ contract BridgeLock is ReentrancyGuard {
             keccak256(abi.encodePacked(parsedTx.inputs[1].prevoutHash, parsedTx.inputs[1].prevoutIndex));
         if (stampUtxoConsumedBy[stampKey] != bytes32(0)) revert UtxoAlreadyUsed();
 
+        // The burn input's own outpoint closes the honest-key double-stamp gap --
+        // see burnUtxoConsumedBy's own doc comment (2026-07 review, round 4).
+        bytes32 burnKey =
+            keccak256(abi.encodePacked(parsedTx.inputs[0].prevoutHash, parsedTx.inputs[0].prevoutIndex));
+        if (burnUtxoConsumedBy[burnKey] != bytes32(0)) revert UtxoAlreadyUsed();
+
         (bytes32 tokenId, uint64 burnQuantity, bytes32 assetId, bytes20 recipientHash160) =
             _parseBurnOpReturn(parsedTx.outputs[0].script);
         if (assetId != bytes32(bytes20(address(this)))) revert WrongAsset();
@@ -807,6 +844,7 @@ contract BridgeLock is ReentrancyGuard {
         if (!MerkleProof.verify(burnTxid, merkleBranch, merkleIndex, root)) revert InvalidMerkleProof();
 
         stampUtxoConsumedBy[stampKey] = burnTxid;
+        burnUtxoConsumedBy[burnKey] = burnTxid;
 
         // burnQuantity is already XEC-side (xecDecimals) units; convert back to
         // token's own decimals -- the symmetric inverse of confirmDeposit(). If XEC
