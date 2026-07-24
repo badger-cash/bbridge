@@ -20,7 +20,8 @@ function buildSignedBurnTx({
   stampSighashType,
   stampCoinOverride,
   burnerOverride,
-  recipientHash160Override
+  recipientHash160Override,
+  burnInputValue
 }) {
   const burner = burnerOverride ?? KeyRing.fromPrivate(crypto.randomBytes(32), true)
   const authorizer = KeyRing.fromPrivate(Buffer.from(authorizerPrivateKey.replace(/^0x/, ''), 'hex'), true)
@@ -30,7 +31,12 @@ function buildSignedBurnTx({
   const burnerScript = p2pkhScript(Hash160.digest(burnerPubkey))
   const authorizerScript = p2pkhScript(Hash160.digest(authorizerPubkey))
 
-  const burnerCoin = new Coin({ hash: crypto.randomBytes(32), index: 0, value: 546, script: burnerScript })
+  // burnInputValue defaults to the mint-time dust constant (546), matching what a
+  // freshly-minted, never-moved coin is actually worth -- overridable so a test can
+  // prove a burn of a coin that's since taken on a different value (ordinary SLP
+  // consolidation/SEND) still releases correctly (2026-07 review,
+  // hardcoded-burn-input-value fix).
+  const burnerCoin = new Coin({ hash: crypto.randomBytes(32), index: 0, value: burnInputValue ?? 546, script: burnerScript })
   const stampValue = 2000
   // stampCoinOverride lets a caller reuse the exact same stamp outpoint across two
   // otherwise-independent burn transactions -- standing in for a malleated
@@ -85,7 +91,7 @@ function buildSignedBurnTx({
 
   tx.check(flags) // real eCash script verification, same as packages/sdk's own tests
 
-  return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, stampCoin, burner }
+  return { rawTx: tx.toRaw(), txid: tx.hash(), stampValue, stampCoin, burner, burnInputValue: burnerCoin.value }
 }
 
 // Mirrors BridgeLock.sol's `keccak256(abi.encodePacked(prevoutHash, prevoutIndex))` for
@@ -145,7 +151,7 @@ describe('BridgeLock.release()', function () {
     const before = await token.balanceOf(bridge.address)
     const expectedReleaseAmount = (burnQuantity - feeAmountXec) / scale
 
-    const tx = await bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+    const tx = await bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     const receipt = await tx.wait()
     const event = receipt.events.find((e) => e.event === 'WithdrawalReleased')
 
@@ -164,10 +170,10 @@ describe('BridgeLock.release()', function () {
     })
     const header = mineSingleTxHeader(txid)
 
-    await bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+    await bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
 
     await expect(
-      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+      bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'UtxoAlreadyUsed')
   })
 
@@ -185,7 +191,7 @@ describe('BridgeLock.release()', function () {
       burnQuantity
     })
     const header = mineSingleTxHeader(txid)
-    await bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+    await bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
 
     // Simulate a malleated resubmission by constructing an *independent* burn tx that
     // spends the exact same stamp coin (same outpoint) -- standing in for "the same
@@ -204,7 +210,7 @@ describe('BridgeLock.release()', function () {
     const header2 = mineSingleTxHeader(txid2)
 
     await expect(
-      bridge.release('0x' + rawTx2.toString('hex'), stampValue, [], 0, '0x' + header2.toString('hex'))
+      bridge.release('0x' + rawTx2.toString('hex'), 546, stampValue, [], 0, '0x' + header2.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'UtxoAlreadyUsed')
   })
 
@@ -219,7 +225,7 @@ describe('BridgeLock.release()', function () {
     const header = mineSingleTxHeader(txid)
 
     await expect(
-      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+      bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'WrongAsset')
   })
 
@@ -234,7 +240,7 @@ describe('BridgeLock.release()', function () {
     const header = mineSingleTxHeader(txid)
 
     await expect(
-      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+      bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'InvalidStampSignature')
   })
 
@@ -260,7 +266,7 @@ describe('BridgeLock.release()', function () {
     const header = mineSingleTxHeader(txid)
 
     await expect(
-      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+      bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'InvalidStampSignature')
   })
 
@@ -275,7 +281,7 @@ describe('BridgeLock.release()', function () {
     const header = mineSingleTxHeader(txid)
 
     await expect(
-      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+      bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'WrongTokenId')
   })
 
@@ -290,7 +296,7 @@ describe('BridgeLock.release()', function () {
     const header = mineSingleTxHeader(txid)
 
     await expect(
-      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+      bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'RecipientMismatch')
   })
 
@@ -321,8 +327,43 @@ describe('BridgeLock.release()', function () {
     const header = mineSingleTxHeader(txid)
 
     await expect(
-      bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+      bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     ).to.be.revertedWithCustomError(bridge, 'RecipientMismatch')
+  })
+
+  it('releases a burn whose coin is worth something other than the mint-time dust constant (2026-07 review, hardcoded-burn-input-value fix)', async function () {
+    // Standing in for a coin that's been through ordinary SLP consolidation/SEND
+    // since it was minted, so it no longer holds exactly SLP_DUST_SATS (546) --
+    // before this fix, _verifyBurnInput hardcoded 546 into the sighash digest it
+    // recomputes, so this would have failed signature verification and permanently
+    // stranded the burner's funds no matter what they actually signed.
+    const { rawTx, txid, stampValue, burnInputValue } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity,
+      burnInputValue: 2200
+    })
+    const header = mineSingleTxHeader(txid)
+
+    await expect(
+      bridge.release('0x' + rawTx.toString('hex'), burnInputValue, stampValue, [], 0, '0x' + header.toString('hex'))
+    ).to.emit(bridge, 'WithdrawalReleased')
+  })
+
+  it('rejects a burn released against the wrong burnInputValue', async function () {
+    const { rawTx, txid, stampValue, burnInputValue } = buildSignedBurnTx({
+      authorizerPrivateKey: authorizerWallet.privateKey,
+      bridgeAddress: bridge.address,
+      tokenId,
+      burnQuantity,
+      burnInputValue: 2200
+    })
+    const header = mineSingleTxHeader(txid)
+
+    await expect(
+      bridge.release('0x' + rawTx.toString('hex'), burnInputValue + 1, stampValue, [], 0, '0x' + header.toString('hex'))
+    ).to.be.revertedWithCustomError(bridge, 'InvalidBurnSignature')
   })
 })
 
@@ -376,7 +417,7 @@ describe('BridgeLock.release() with a >9-decimal token (Finding #2/#4 decimal sc
     const before = await token.balanceOf(bridge.address)
     const expectedReleaseAmount = (burnQuantity - feeAmountXec) * scale
 
-    const tx = await bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+    const tx = await bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
     const receipt = await tx.wait()
     const event = receipt.events.find((e) => e.event === 'WithdrawalReleased')
 
@@ -435,7 +476,7 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
     })
     const header1 = mineSingleTxHeader(txid1)
 
-    const tx1 = await bridge.release('0x' + rawTx1.toString('hex'), stampValue1, [], 0, '0x' + header1.toString('hex'))
+    const tx1 = await bridge.release('0x' + rawTx1.toString('hex'), 546, stampValue1, [], 0, '0x' + header1.toString('hex'))
     const receipt1 = await tx1.wait()
     const event1 = receipt1.events.find((e) => e.event === 'WithdrawalReleased')
 
@@ -456,7 +497,7 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
     })
     const header2 = mineSingleTxHeader(txid2)
 
-    const tx2 = await bridge.release('0x' + rawTx2.toString('hex'), stampValue2, [], 0, '0x' + header2.toString('hex'))
+    const tx2 = await bridge.release('0x' + rawTx2.toString('hex'), 546, stampValue2, [], 0, '0x' + header2.toString('hex'))
     const receipt2 = await tx2.wait()
     const event2 = receipt2.events.find((e) => e.event === 'WithdrawalReleased')
     const dustEvent = receipt2.events.find((e) => e.event === 'DustCollected')

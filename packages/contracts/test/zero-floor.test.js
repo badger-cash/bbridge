@@ -203,7 +203,7 @@ describe('BridgeLock zero-floor fixes', function () {
       const header = mineSingleTxHeader(txid)
 
       await expect(
-        bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+        bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
       ).to.be.revertedWithCustomError(bridge, 'AmountTooSmall')
 
       // The revert unwinds the earlier `stampUtxoConsumedBy[stampKey] = burnTxid`
@@ -217,7 +217,7 @@ describe('BridgeLock zero-floor fixes', function () {
       const header = mineSingleTxHeader(txid)
       const expectedRecipient = ethers.utils.computeAddress('0x' + burner.getPublicKey().toString('hex'))
 
-      const tx = await bridge.release('0x' + rawTx.toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+      const tx = await bridge.release('0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex'))
       const receipt = await tx.wait()
       const event = receipt.events.find((e) => e.event === 'WithdrawalReleased')
 

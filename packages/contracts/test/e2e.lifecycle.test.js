@@ -256,7 +256,14 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
     const expectedEthRecipient = ethers.utils.computeAddress('0x' + recipientRing.getPublicKey().toString('hex'))
     const bridgeBalanceBeforeRelease = await token.balanceOf(bridge.address)
 
-    const releaseTx = await bridge.release('0x' + burnTx.toRaw().toString('hex'), stampValue, [], 0, '0x' + header.toString('hex'))
+    const releaseTx = await bridge.release(
+      '0x' + burnTx.toRaw().toString('hex'),
+      SLP_DUST_SATS,
+      stampValue,
+      [],
+      0,
+      '0x' + header.toString('hex')
+    )
     const releaseReceipt = await releaseTx.wait()
     const releaseEvent = releaseReceipt.events.find((e) => e.event === 'WithdrawalReleased')
 

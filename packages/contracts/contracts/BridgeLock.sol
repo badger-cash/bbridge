@@ -721,10 +721,21 @@ contract BridgeLock is ReentrancyGuard {
     /// DRAFT: only handles the specific two-input shape from overview.md `6.`
     /// (input 0 = burner's P2PKH SLP input, SIGHASH_ALL|ANYONECANPAY|FORKID; input 1
     /// = Authorizer's P2PKH stamp input, SIGHASH_ALL|FORKID) and compressed pubkeys.
-    /// `stampValue` has to be supplied by the caller because, like every
-    /// Bitcoin-family transaction, this one doesn't self-describe its inputs' coin
-    /// values -- contracts-spec.md `8.` flags this as still needing a real design
-    /// decision (e.g. a fixed stamp weight) rather than an open caller-supplied value.
+    /// `stampValue` and `burnInputValue` have to be supplied by the caller because,
+    /// like every Bitcoin-family transaction, this one doesn't self-describe its
+    /// inputs' coin values -- contracts-spec.md `8.` flags this as still needing a
+    /// real design decision (e.g. a fixed stamp weight) rather than an open
+    /// caller-supplied value.
+    ///
+    /// `burnInputValue` (2026-07 review, hardcoded-burn-input-value finding): input 0
+    /// used to have its value hardcoded to `SLP_DUST_SATS`, the mint-time constant --
+    /// but nothing on XEC keeps a token-carrying UTXO at exactly that value after its
+    /// first hop (ordinary SLP consolidation/SEND changes it), and a wrong value here
+    /// makes `_verifyBurnInput`'s recomputed sighash digest never match the burner's
+    /// real signature, permanently and unrecoverably (the coin is already burned) --
+    /// deterministically rejecting a legitimate burn, and cheaply griefable by anyone
+    /// who can send the victim's coin a non-mint-standard value beforehand. Made
+    /// caller-supplied for exactly the same reason `stampValue` already is.
     ///
     /// HEADER-FORGERY + MALLEABILITY (2026-07 review): this contract's header check
     /// below only verifies the supplied header is internally self-consistent and
@@ -764,6 +775,7 @@ contract BridgeLock is ReentrancyGuard {
     /// comments.
     function release(
         bytes calldata rawBurnTx,
+        uint64 burnInputValue,
         uint64 stampValue,
         bytes32[] calldata merkleBranch,
         uint256 merkleIndex,
@@ -786,7 +798,7 @@ contract BridgeLock is ReentrancyGuard {
         if (tokenId != xecTokenId) revert WrongTokenId();
         if (burnQuantity <= feeAmountXec) revert AmountTooSmall();
 
-        (address ethRecipient, bytes20 pubkeyHash160) = _verifyBurnInput(parsedTx);
+        (address ethRecipient, bytes20 pubkeyHash160) = _verifyBurnInput(parsedTx, burnInputValue);
         if (pubkeyHash160 != recipientHash160) revert RecipientMismatch();
         _verifyStampInput(parsedTx, stampValue);
 
@@ -843,7 +855,7 @@ contract BridgeLock is ReentrancyGuard {
     /// correctly; it says nothing about whether that keypair is the coin's real
     /// owner, since this contract has no way to look up input 0's actual previous
     /// output. The caller-side check is what closes that gap.
-    function _verifyBurnInput(EcashTx.Tx memory parsedTx)
+    function _verifyBurnInput(EcashTx.Tx memory parsedTx, uint64 burnInputValue)
         private
         view
         returns (address ethRecipient, bytes20 pubkeyHash160)
@@ -855,7 +867,7 @@ contract BridgeLock is ReentrancyGuard {
         (uint256 x, uint256 y) = EcashTx.decompress(pubkey);
         pubkeyHash160 = EcashTx.hash160(pubkey);
         bytes memory scriptCode = EcashTx.p2pkhScriptCode(pubkeyHash160);
-        bytes32 digest = Sighash.digest(parsedTx, 0, scriptCode, SLP_DUST_SATS, 0x01 | 0x40 | 0x80);
+        bytes32 digest = Sighash.digest(parsedTx, 0, scriptCode, burnInputValue, 0x01 | 0x40 | 0x80);
 
         if (!EcashTx.verifyAgainstPubkey(digest, r, s, x, y)) revert InvalidBurnSignature();
 
