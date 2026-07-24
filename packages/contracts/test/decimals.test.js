@@ -47,6 +47,7 @@ function randomUtxo() {
 
 describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
   const minConfirmations = 3
+  const refundDelay = 20
   const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1)
 
@@ -70,7 +71,8 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       feeAmount,
       minConfirmations,
       xecNetworkId,
-      minDifficultyTarget
+      minDifficultyTarget,
+      refundDelay
     )
     await bridge.deployed()
 
@@ -139,6 +141,8 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       const receipt = await tx.wait()
       const depositId = receipt.events.find((e) => e.event === 'DepositLocked').args.depositId
 
+      await bridge.connect(depositor).requestRefund(depositId)
+      for (let i = 0; i < refundDelay; i++) await ethers.provider.send('evm_mine')
       await bridge.connect(depositor).refund(depositId)
 
       // Full deposited amount comes back, including the sub-9-decimal remainder --
@@ -215,7 +219,8 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
         1, // feeAmount, far below scale -> feeAmountXec would floor to 0
         minConfirmations,
         xecNetworkId,
-        minDifficultyTarget
+        minDifficultyTarget,
+        refundDelay
       )
     ).to.be.revertedWithCustomError(Bridge, 'FeeTooSmallForScale')
   })
@@ -240,7 +245,8 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
         1_000,
         minConfirmations,
         xecNetworkId,
-        minDifficultyTarget
+        minDifficultyTarget,
+        refundDelay
       )
     ).to.be.revertedWithCustomError(Bridge, 'InvalidXecDecimals')
   })
@@ -274,7 +280,8 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       1_000,
       minConfirmations,
       xecNetworkId,
-      minDifficultyTarget
+      minDifficultyTarget,
+      refundDelay
     )
     await bridge.deployed()
 
@@ -302,7 +309,8 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
       1_000,
       minConfirmations,
       xecNetworkId,
-      minDifficultyTarget
+      minDifficultyTarget,
+      refundDelay
     )
     await bridge.deployed()
 

@@ -30,6 +30,7 @@ describe('BridgeLock', function () {
   const tokenDecimals = 6 // matches USDC/USDT
   const xecDecimals = 9 // matches the actual SLP GENESIS decimals for the wrapped token; > tokenDecimals, so scale=1000 and XEC is the more precise side
   const minConfirmations = 3
+  const refundDelay = 20
   const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1) // permissive floor; withdrawal PoW tested separately
 
@@ -56,7 +57,8 @@ describe('BridgeLock', function () {
       feeAmount,
       minConfirmations,
       xecNetworkId,
-      minDifficultyTarget
+      minDifficultyTarget,
+      refundDelay
     )
     await bridge.deployed()
 
@@ -103,6 +105,8 @@ describe('BridgeLock', function () {
     const before = await token.balanceOf(depositor.address)
     const { depositId } = await makeDeposit(amount)
 
+    await bridge.connect(depositor).requestRefund(depositId)
+    for (let i = 0; i < refundDelay; i++) await ethers.provider.send('evm_mine')
     await expect(bridge.connect(depositor).refund(depositId))
       .to.emit(bridge, 'DepositRefunded')
       .withArgs(depositId)
@@ -118,6 +122,8 @@ describe('BridgeLock', function () {
 
   it('rejects a double refund', async function () {
     const { depositId } = await makeDeposit(ethers.utils.parseUnits('10', 6))
+    await bridge.connect(depositor).requestRefund(depositId)
+    for (let i = 0; i < refundDelay; i++) await ethers.provider.send('evm_mine')
     await bridge.connect(depositor).refund(depositId)
     await expect(bridge.connect(depositor).refund(depositId)).to.be.revertedWithCustomError(bridge, 'AlreadyRefunded')
   })

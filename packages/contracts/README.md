@@ -4,7 +4,7 @@ Reference Solidity implementation of the bbridge Ethereum Lock Contract, per [`d
 
 ## Status
 
-Functional and tested: `npx hardhat test` runs 42 passing cases. Implements deposit, refund, confirmation, authorization publication, and withdrawal release in full, including real eCash transaction parsing, dual-signature verification, Merkle inclusion, the proof-of-work floor check, and per-deployment decimal scaling between `token`'s own decimals and the wrapped token's XEC-side decimals (dust from either leg reclassified as counted fee revenue, never confiscated from other users). Cross-tested against the real eCash-side self-mint covenant (`packages/sdk`'s `mintCovenantV2`) in a single deposit-to-release round trip spanning both chains (`test/e2e.lifecycle.test.js`), not just independently. Draft, not audited. Several deployment parameters have no chosen production value yet — see `docs/SPEC.md` Appendix A.
+Functional and tested: `npx hardhat test` runs 63 passing cases. Implements deposit, refund (with a `requestRefund()`/`refundDelay` cooldown, defense-in-depth alongside the vault UTXO quarantine requirement in `docs/SPEC.md` §III.7), confirmation, authorization publication, and withdrawal release in full, including real eCash transaction parsing, dual-signature verification, Merkle inclusion, the proof-of-work floor check, and per-deployment decimal scaling between `token`'s own decimals and the wrapped token's XEC-side decimals (dust from either leg reclassified as counted fee revenue, never confiscated from other users). Cross-tested against the real eCash-side self-mint covenant (`packages/sdk`'s `mintCovenantV2`) in a single deposit-to-release round trip spanning both chains (`test/e2e.lifecycle.test.js`), not just independently. Draft, not audited. Several deployment parameters have no chosen production value yet — see `docs/SPEC.md` Appendix A.
 
 ## Installation
 
@@ -43,7 +43,9 @@ No parameter is settable after construction. There is no owner or administrative
 | Function | Description |
 |---|---|
 | `deposit(uint256 amount, bytes20 xecRecipient) external returns (bytes32 depositId)` | Locks `amount` of `token` (via `transferFrom`; caller must have approved first), recording the net amount (in `token`'s own decimals) and XEC recipient. Reverts `AmountTooSmall` if `amount <= feeAmount`, `AmountTooLarge` if the net amount doesn't fit `uint96`. |
-| `refund(bytes32 depositId) external` | Returns the full original locked amount to the depositor. Reverts `UnknownDeposit`, `AlreadyConfirmed`, `AlreadyRefunded`, or `NotDepositor` as applicable. |
+| `requestRefund(bytes32 depositId) external` | Signals refund intent and starts the `refundDelay`-block cooldown gating `refund()` below; moves no funds, re-callable to restart the cooldown. Reverts `UnknownDeposit`, `AlreadyConfirmed`, `AlreadyRefunded`, or `NotDepositor` as applicable. |
+| `cancelRefundRequest(bytes32 depositId) external` | Withdraws a live refund request, resetting the cooldown to zero. Reverts `UnknownDeposit`, `NotDepositor`, or `RefundNotRequested` (no live request) as applicable. |
+| `refund(bytes32 depositId) external` | Returns the full original locked amount to the depositor. Requires a prior `requestRefund()` call and at least `refundDelay` blocks elapsed since it (2026-07 review, defense-in-depth alongside vault UTXO quarantine — `docs/SPEC.md` §III.7). Reverts `UnknownDeposit`, `AlreadyConfirmed`, `AlreadyRefunded`, `NotDepositor`, `RefundNotRequested`, or `RefundDelayNotElapsed` as applicable. |
 | `confirmDeposit(bytes32 depositId, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s) external` | Authorizer confirmation. `utxoTxid`/`utxoIndex` name a real, 36-byte eCash vault outpoint, not an opaque reference. Converts the deposit's `netAmount` to XEC-side (`xecDecimals`) units, banking any division-remainder as counted fee revenue. Reverts `TooEarlyToConfirm` before `minConfirmations` has elapsed, `UtxoAlreadyUsed` if the outpoint already backs a different deposit's confirmation, `AmountTooLarge` if the converted amount overflows `uint64`, `InvalidAuthorizerSignature` if the signature does not verify against the contract-computed digest (`docs/SPEC.md` §III.4). |
 | `getAuthorization(bytes32 depositId) external view returns (bool confirmed, bytes20 xecRecipient, uint64 xecAmount, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s)` | Public, unauthenticated read of a deposit's authorization content and signature. `xecAmount` is the XEC-side (post-conversion) quantity actually signed, recomputed from stored state rather than stored separately. |
 | `release(bytes calldata rawBurnTx, uint64 stampValue, bytes32[] calldata merkleBranch, uint256 merkleIndex, bytes calldata rawHeader) external` | Parses `rawBurnTx`, verifies both signatures on it, verifies the burn's self-reported `token_id` against `xecTokenId` (`WrongTokenId` on mismatch), verifies `rawHeader` against the difficulty floor, verifies Merkle inclusion, converts the burned XEC-side quantity back to `token`'s own decimals (banking any division-remainder), and releases funds to the address derived from the burn's own signing key (`docs/SPEC.md` §IV.4). `stampValue` is the postage input's coin value — not self-describing in the transaction, so it must be supplied by the caller. |
@@ -53,6 +55,8 @@ No parameter is settable after construction. There is no owner or administrative
 ```solidity
 event DepositLocked(bytes32 indexed depositId, address indexed depositor, uint96 netAmount, bytes20 xecRecipient);
 event DepositRefunded(bytes32 indexed depositId);
+event RefundRequested(bytes32 indexed depositId, uint256 requestedAtBlock);
+event RefundRequestCancelled(bytes32 indexed depositId);
 event DepositConfirmed(bytes32 indexed depositId, bytes32 utxoTxid, uint32 utxoIndex);
 event WithdrawalReleased(bytes32 indexed burnTxid, address indexed recipient, uint256 amount, bytes32 tokenId);
 event DustCollected(uint256 amount, uint256 totalCollectedDust);
@@ -63,7 +67,7 @@ event GenesisRecorded(bytes32 indexed tokenId, string ticker, string name, uint8
 
 ### Errors
 
-`UnknownDeposit`, `AlreadyConfirmed`, `AlreadyRefunded`, `NotDepositor`, `TooEarlyToConfirm`, `InvalidAuthorizerSignature`, `AmountTooSmall`, `AmountTooLarge`, `FeeTooSmallForScale`, `InvalidXecDecimals`, `UtxoAlreadyUsed`, `AlreadyRedeemed`, `WrongAsset`, `WrongTokenId`, `InvalidBurnSignature`, `InvalidStampSignature`, `HeaderBelowDifficultyFloor`, `InvalidMerkleProof`.
+`UnknownDeposit`, `AlreadyConfirmed`, `AlreadyRefunded`, `NotDepositor`, `TooEarlyToConfirm`, `InvalidAuthorizerSignature`, `AmountTooSmall`, `AmountTooLarge`, `FeeTooSmallForScale`, `InvalidXecDecimals`, `UtxoAlreadyUsed`, `AlreadyRedeemed`, `WrongAsset`, `WrongTokenId`, `InvalidBurnSignature`, `InvalidStampSignature`, `HeaderBelowDifficultyFloor`, `InvalidMerkleProof`, `ZeroAuthorizer`, `RefundNotRequested`, `RefundDelayNotElapsed`.
 
 ## Design decisions
 
@@ -81,7 +85,8 @@ Four are worth understanding before modifying this contract, since each looks li
 
 ```
 contracts/
-  BridgeLock.sol          deposit, refund, confirmDeposit, getAuthorization, release
+  BridgeLock.sol          deposit, refund (requestRefund/cancelRefundRequest gate), confirmDeposit,
+                          getAuthorization, release
   lib/
     MerkleProof.sol        Merkle inclusion, kept in sync with packages/sdk/src/merkle.ts
     Difficulty.sol         compact-bits target conversion, single-header PoW floor check
@@ -94,6 +99,11 @@ test/
                              replay-fix cases (audit finding #1)
   decimals.test.js          tokenDecimals != xecDecimals scaling, dust accounting, uint64/uint96
                              overflow bounds
+  audit-fixes.test.js       zero-address authorizer (finding #3), deposit()/refund() balance-delta
+                             accounting against a fee-on-transfer token (finding #5)
+  zero-floor.test.js        confirmDeposit()/release() zero-floor division-to-zero fixes
+  refund-delay.test.js      requestRefund()/cancelRefundRequest()/refundDelay cooldown mechanism
+                             (2026-07 review, defense-in-depth alongside vault UTXO quarantine)
   release.test.js           full withdrawal path against a real, signed burn transaction
   e2e.lifecycle.test.js     the full protocol round trip in one test: deposit -> confirm -> mint
                              (real mintCovenantV2 covenant execution) -> burn -> release, each

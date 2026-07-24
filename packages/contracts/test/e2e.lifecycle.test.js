@@ -44,6 +44,7 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
   const xecDecimals = 9 // XEC is the more precise side; scale = 1000, exact both ways
   const scale = 1000n
   const minConfirmations = 3
+  const refundDelay = 20
   const xecNetworkId = '0x' + Buffer.from('ETH').toString('hex').padEnd(16, '0')
   const minDifficultyTarget = ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString())
 
@@ -84,7 +85,8 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
       feeAmount,
       minConfirmations,
       xecNetworkId,
-      minDifficultyTarget
+      minDifficultyTarget,
+      refundDelay
     )
     await bridge.deployed()
     const xecTokenId = await bridge.xecTokenId()

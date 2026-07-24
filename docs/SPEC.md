@@ -3,7 +3,7 @@
 # bbridge Protocol Specification
 
 ### Specification version: 0.2
-### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 34 passing cases; `packages/contracts`: 42 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
+### Status: draft — architecture and message formats below are implemented and tested (`packages/sdk`: 34 passing cases; `packages/contracts`: 63 passing cases, including a full deposit-to-release round trip spanning both chains in a single test); several deployment parameters and byte-level details remain reserved for future specification (Appendix A)
 
 # Table of Contents
 
@@ -22,6 +22,7 @@
 &nbsp;&nbsp;&nbsp;&nbsp;[4. Authorization Content](#4-authorization-content)
 &nbsp;&nbsp;&nbsp;&nbsp;[5. Publication](#5-publication)
 &nbsp;&nbsp;&nbsp;&nbsp;[6. Mint](#6-mint)
+&nbsp;&nbsp;&nbsp;&nbsp;[7. Vault UTXO Quarantine (Authorizer Requirement)](#7-vault-utxo-quarantine-authorizer-requirement)
 
 [SECTION IV: WITHDRAWAL — XEC TO ETHEREUM](#section-iv-withdrawal--xec-to-ethereum)
 &nbsp;&nbsp;&nbsp;&nbsp;[1. Burn Transaction](#1-burn-transaction)
@@ -87,7 +88,7 @@ The wrapped token is deployed once per bridged asset as an SLP Token Type 2 toke
 
 Per the SLP Token Type 2 specification, a `MINT` transaction is valid only in a block subsequent to the block containing its `GENESIS` transaction. The first deposit for a newly-deployed asset cannot be minted until `GENESIS` has confirmed.
 
-Type 2's MINT Vault model permits any UTXO held at the vault's P2SH address to authorize a mint; unlike Type 1's MINT Baton, no mint is required to recreate or pass forward a specific UTXO. The vault address must independently be kept funded with enough spendable UTXOs to support the volume of concurrent mints expected; this is an operational funding concern, not a protocol requirement.
+Type 2's MINT Vault model permits any UTXO held at the vault's P2SH address to authorize a mint; unlike Type 1's MINT Baton, no mint is required to recreate or pass forward a specific UTXO. The vault address must independently be kept funded with enough spendable UTXOs to support the volume of concurrent mints expected; this is an operational funding concern, not a protocol requirement — subject to the vault UTXO quarantine requirement (Section III.7): whenever a vault UTXO is funded specifically to back a not-yet-confirmed deposit's authorization, its funding transaction must not be broadcast until that confirmation has landed, whether it's funded singly or as part of a batch.
 
 ---
 
@@ -109,6 +110,10 @@ At confirmation (Section III.3), `netAmount` is converted to the XEC-side quanti
 ## 2. Refund
 
 Before confirmation (Section III.3), the depositor may reclaim the full original locked amount using only their own key. No cooperation from the Authorizer or any other party is required or possible. This path closes permanently once the deposit is confirmed.
+
+Reclaiming is a two-step process, gated by a deployment-fixed `refundDelay` (blocks): the depositor first calls `requestRefund()`, which records the current block number and emits `RefundRequested` — moving no funds — and only after at least `refundDelay` blocks have elapsed since that call does `refund()` itself become callable. A live request can be withdrawn at any time via `cancelRefundRequest()`, which resets the cooldown to zero; a subsequent `requestRefund()` call pays the full delay again rather than resuming progress. Re-calling `requestRefund()` while a request is already live simply restarts the cooldown from the new block.
+
+This delay is a **defense-in-depth mitigation, added 2026-07, layered on top of — not a substitute for — the vault UTXO quarantine requirement (Section III.7), which remains the actual, structural fix for the confirmation/refund race described there.** The mechanism only helps if the Authorizer's own service is actively watching for `RefundRequested` and reacts within the window, either by landing its own pending `confirmDeposit()` first or by declining to sign once a request becomes visible; it gives that service advance, observable warning it never had under a single-step refund (whose front-run was instantaneous and unannounced), narrowing the practical window in which the race in Section III.7 can be won. It does **not**, on its own, close the underlying gap: a signature the Authorizer already produced and broadcast before ever seeing the refund request remains independently valid and usable on XEC no matter what happens to `refund()` afterward. Quarantine is what makes that stale signature harmless even so; this delay is not a reason to relax quarantine.
 
 ## 3. Confirmation
 
@@ -158,6 +163,23 @@ Spending the covenant requires, as witness items: the minter's own signature and
 5. Performs a final, standard `OP_CHECKSIG` against the real, VM-computed sighash of the transaction actually being broadcast, reusing the *same* minter signature bytes already verified against the supplied preimage in step 2 — since one ECDSA signature cannot validly verify against two different messages, this proves the preimage supplied in step 2 genuinely describes the transaction being broadcast, not independently fabricated bytes.
 
 Only the constructing party's own key signs this transaction; the Authorizer never broadcasts anything to XEC; its signature and the content it covers come entirely from Ethereum.
+
+## 7. Vault UTXO Quarantine (Authorizer Requirement)
+
+**This is a mandatory requirement on the Authorizer service's implementation, not an on-chain-enforced control.** No mechanism in `BridgeLock.sol` or the self-mint covenant can verify or enforce it — Ethereum has no visibility into XEC chain state, and the covenant has no visibility into Ethereum state, by design (Section VI, "Independent verifiability"). It is nonetheless load-bearing: without it, the property described below (Section VI) does not hold.
+
+**The requirement.** The Authorizer's ECDSA signature over a confirmation's `message` (Section III.4) is, on its own, an unconditionally valid and permanently reusable authorization — its validity depends only on the message content, never on whether the Ethereum `confirmDeposit()` call carrying it succeeds, fails, or is ever mined at all. If the vault UTXO it references (`utxoTxid`/`utxoIndex`) already exists and is already spendable on XEC at the moment that signature first becomes observable (e.g. sitting in Ethereum's public mempool before `confirmDeposit()` mines), then a depositor who reads that signature out of the pending transaction can front-run it with `refund()` (Section III.2) — which has no dependency on, and is not slowed by, a signature merely existing — collect their full refund, and *still* use the already-valid signature to complete an unbacked mint on XEC, since the covenant never asks whether Ethereum's confirmation actually landed.
+
+To close this, the Authorizer **must**:
+
+1. Construct the specific XEC transaction that will fund the vault UTXO referenced in a given confirmation's `message`, and compute its txid, *before* signing and submitting the corresponding `confirmDeposit()` call. (A transaction's txid is fully determined by its own serialized bytes — this requires no broadcast.)
+2. **Not broadcast that funding transaction to the XEC network until the Authorizer has independently observed the corresponding `confirmDeposit()` transaction reach the Authorizer's own required Ethereum finality depth.** Until that funding transaction is broadcast, the referenced UTXO does not exist in the XEC UTXO set — no mint transaction spending it can be constructed or accepted by XEC consensus, regardless of how many valid-looking signatures reference it. If `confirmDeposit()` never lands (including the front-run-by-`refund()` case above, which resolves as `AlreadyRefunded`), the funding transaction is simply never broadcast, and the referenced coin never comes into existence.
+3. Choose an Ethereum finality depth for step 2 that is genuinely resistant to reorg — broadcasting the funding transaction is itself effectively irreversible once it confirms on XEC, so it must not be triggered by an Ethereum confirmation that could later disappear in a reorg.
+4. Apply this per referenced UTXO, not per batch. **If several vault UTXOs are funded together in one XEC transaction (batch pre-funding — Section II), that entire batch must stay quarantined until *every* `confirmDeposit()` call referencing an output of that batch has reached finality.** Broadcasting a batch early because *one* of several referenced confirmations succeeded reveals every other UTXO in that batch too — including ones still backing a pending confirmation, reopening exactly the race this section exists to close for those.
+
+This is the standard "UTXO quarantine" pattern for self-mint-protocol-style bridges: a signed authorization and the coin it references must become usable at the same time, not separately — the signature alone must never be sufficient.
+
+An on-chain `requestRefund()`/`refundDelay` cooldown (Section III.2) exists alongside this requirement as defense-in-depth, not as a replacement for it: it narrows the window in which the race described above can be won by giving the Authorizer's monitor advance warning, but it is a best-effort mitigation contingent on that monitor actually reacting, not a structural guarantee. Quarantine is what makes a signature extracted during that window harmless regardless.
 
 ---
 
@@ -265,10 +287,12 @@ Bitcoin-family algorithm (double SHA-256 parent hashing, duplicate-last-node han
 - **No double-authorization.** A deposit may be confirmed at most once (invariant 6).
 - **No double-redemption.** An authorization may be minted at most once (invariant 7): it is bound to one vault UTXO (Section III.4), spendable once — enforced primarily on the eCash side by consensus itself (a UTXO can only be spent once), and defense-in-depth on Ethereum too: `utxoConsumedBy` (Section III.3) additionally rejects a second confirmation against a vault outpoint already bound to a different `depositId`, so this invariant no longer rests solely on an assumption about eCash-side covenant behavior the Ethereum Lock Contract cannot itself verify.
 - **`depositId` binding.** A signature is scoped to the exact `depositId` it was produced for (Section III.4) — it can never validly authorize a different deposit, even one sharing an identical recipient and amount.
+- **A confirmation signature is never independently usable before its deposit is irreversibly confirmed.** An Authorizer signature over `message` is, by itself, unconditionally valid the moment it exists — its validity has no dependency on whether the Ethereum `confirmDeposit()` call carrying it succeeds. Without a further control, this would let a depositor extract a not-yet-mined signature (e.g. from Ethereum's public mempool), win a race against it with `refund()`, and still complete an unbacked mint on XEC. This is closed entirely off-chain, by the vault UTXO quarantine requirement (Section III.7): the referenced vault UTXO must not exist on XEC — and therefore cannot back any mint — until the Authorizer has independently observed the confirmation reach finality. Unlike every other property in this list, this one is not enforced by either chain's consensus or contract code; it is a mandatory operational requirement on the Authorizer service's implementation.
 - **Two-factor withdrawal release.** Release requires a valid Authorizer signature and an independently-clearing proof-of-work floor; neither is sufficient alone (Section IV.5).
 - **Independent verifiability.** Any party may recompute expected deposit authorization content from public data and verify the Authorizer's signature against it, without trusting an out-of-band claim about which deployment or asset is in play.
 - **No ongoing cooperation required for withdrawal.** Once the burn transaction of Section IV.1–2 is confirmed, completing a withdrawal requires only public XEC-chain data and requires no further action from the Authorizer or any specific party.
 - **Dust is conserved, not confiscated.** When `tokenDecimals` and `xecDecimals` differ (Section III.1), each individual deposit or release can leave behind a sub-base-unit remainder that cannot be minted or paid out. That remainder is reclassified as counted fee revenue for the deployment as a whole; it is never deducted from any *other* user's own deposit or release beyond that single transaction's own unavoidable fraction.
+- **Refund requires an announced cooldown, not just a click.** `refund()` (Section III.2) can only be called at least `refundDelay` blocks after a `requestRefund()` call, giving the Authorizer's monitor advance, observable warning of refund intent it never had under a single-step refund. This is defense-in-depth on top of, not a substitute for, vault UTXO quarantine (Section III.7) — it narrows the practical window for the race described there, but does not itself make an already-extracted signature harmless.
 
 ---
 
@@ -277,11 +301,12 @@ Bitcoin-family algorithm (double SHA-256 parent hashing, duplicate-last-node han
 The following parameters and formats are implemented with provisional values or are not yet fixed, and require a decision prior to production deployment:
 
 - **`minDifficultyTarget` value.** A deployment-time constant with no chosen real-world value; the test suite uses a maximally permissive placeholder deliberately, not a proposed real one.
+- **`refundDelay` value.** A deployment-time constant (blocks); the test suite uses 20 as a representative placeholder. A real deployment should set this to comfortably exceed the Authorizer service's expected sign-to-mined latency under normal and congested conditions, once that latency is actually measured.
 - **Fee destination.** Collected fees currently accumulate in the Lock Contract's own balance with no further routing logic.
 - **Deployment scope.** One Lock Contract per bridged asset is assumed throughout; a multi-asset contract is not specified.
 - **BURN OP_RETURN compatibility.** The layout in Section V has not been validated against third-party SLP indexing tooling.
 - **Gas cost of withdrawal processing.** Not yet measured against a target ceiling; `BridgeLock.sol` needed `viaIR: true` to compile at all, a signal this code does enough work that a real measurement matters before relying on it.
-- **Authorizer service specification.** Not yet written; key management, deposit-watching, and postage-UTXO management are unspecified.
+- **Authorizer service specification.** Not yet written; key management, deposit-watching, and postage-UTXO management are unspecified. One load-bearing piece of its required behavior *is* specified despite the service itself not existing yet: vault UTXO quarantine (Section III.7) — any implementation must follow it, since the refund/confirmation race it closes is otherwise live regardless of anything else the service does.
 - **Merkle-proof key rotation.** The [SLP self-mint protocol](https://github.com/badger-cash/slp-self-mint-protocol)'s Token Type 2 format includes an optional Merkle-proof extension permitting the Authorizer's eCash-side key to rotate independently of a single static public key. `mintCovenantV2` (Section III.6) deliberately does not implement it in this version, since the Ethereum Lock Contract's own `authorizer` is a single immutable address with no rotation mechanism — rotating only the eCash side would not, by itself, enable real key rotation. A future version intended to support rotation needs a matching mechanism on both sides.
 - **No first-class burn/postage transaction builder in `packages/sdk` yet.** The withdrawal-side transaction (Section IV.1–2) is constructed and proven correct against a deployed `BridgeLock.release()` in `packages/contracts`' own test suite (`test/release.test.js`, `test/e2e.lifecycle.test.js`), using eCash primitives directly — but `packages/sdk` does not yet export a dedicated function for building it, unlike the deposit-side mint transaction (`mintCovenantV2`, Section III.6).
 

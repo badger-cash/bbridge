@@ -27,6 +27,7 @@ function bytes8FromAscii(str) {
 
 describe('BridgeLock zero-floor fixes', function () {
   const minConfirmations = 3
+  const refundDelay = 20
   const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1)
 
@@ -58,7 +59,8 @@ describe('BridgeLock zero-floor fixes', function () {
         feeAmount,
         minConfirmations,
         xecNetworkId,
-        minDifficultyTarget
+        minDifficultyTarget,
+        refundDelay
       )
       await bridge.deployed()
       await token.connect(depositor).approve(bridge.address, ethers.constants.MaxUint256)
@@ -86,6 +88,8 @@ describe('BridgeLock zero-floor fixes', function () {
       expect((await bridge.deposits(depositId)).confirmed).to.equal(false)
 
       // refund() is still open -- the deposit was never confirmed.
+      await bridge.connect(depositor).requestRefund(depositId)
+      for (let i = 0; i < refundDelay; i++) await ethers.provider.send('evm_mine')
       await expect(bridge.connect(depositor).refund(depositId)).to.emit(bridge, 'DepositRefunded')
       expect(await token.balanceOf(depositor.address)).to.equal(10_000n)
     })
@@ -144,7 +148,8 @@ describe('BridgeLock zero-floor fixes', function () {
         feeAmount,
         minConfirmations,
         xecNetworkId,
-        ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString())
+        ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString()),
+        refundDelay
       )
       await bridge.deployed()
       await token.mint(bridge.address, ethers.utils.parseUnits('1000', 6))

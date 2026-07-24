@@ -18,6 +18,7 @@ describe('BridgeLock audit fixes (#3, #5)', function () {
   const xecDecimals = 9
   const feeAmount = 1_000n
   const minConfirmations = 3
+  const refundDelay = 20
   const xecNetworkId = bytes8FromAscii('ETH')
   const minDifficultyTarget = ethers.BigNumber.from(2).pow(256).sub(1)
   const { rawTx: rawGenesisTx } = buildGenesis({ decimals: xecDecimals })
@@ -38,7 +39,8 @@ describe('BridgeLock audit fixes (#3, #5)', function () {
           feeAmount,
           minConfirmations,
           xecNetworkId,
-          minDifficultyTarget
+          minDifficultyTarget,
+          refundDelay
         )
       ).to.be.revertedWithCustomError(Bridge, 'ZeroAuthorizer')
     })
@@ -58,7 +60,8 @@ describe('BridgeLock audit fixes (#3, #5)', function () {
         feeAmount,
         minConfirmations,
         xecNetworkId,
-        minDifficultyTarget
+        minDifficultyTarget,
+        refundDelay
       )
       await bridge.deployed()
       expect(await bridge.authorizer()).to.equal(authorizerWallet.address)
@@ -87,7 +90,8 @@ describe('BridgeLock audit fixes (#3, #5)', function () {
         feeAmount,
         minConfirmations,
         xecNetworkId,
-        minDifficultyTarget
+        minDifficultyTarget,
+        refundDelay
       )
       await bridge.deployed()
 
@@ -129,6 +133,8 @@ describe('BridgeLock audit fixes (#3, #5)', function () {
 
       expect(await token.balanceOf(bridge.address)).to.equal(receivedA + receivedB)
 
+      await bridge.connect(depositorA).requestRefund(depositIdA)
+      for (let i = 0; i < refundDelay; i++) await ethers.provider.send('evm_mine')
       await bridge.connect(depositorA).refund(depositIdA)
 
       // Exactly depositor A's own contribution leaves the pool -- depositor B's share

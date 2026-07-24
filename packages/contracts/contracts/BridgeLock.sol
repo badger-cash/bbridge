@@ -56,6 +56,13 @@ contract BridgeLock {
     /// difficulty -- see Difficulty.meetsFloor) a withdrawal's block header must clear.
     uint256 public immutable minDifficultyTarget;
 
+    /// @dev Minimum number of blocks that must elapse between a live requestRefund()
+    /// call and refund() itself succeeding (2026-07 review, defense-in-depth layer
+    /// against the confirmDeposit()/refund() race -- see requestRefund()'s and
+    /// refund()'s own doc comments for exactly what this does and does not
+    /// guarantee).
+    uint256 public immutable refundDelay;
+
     /// @dev `token`'s own decimals, fixed at construction (not read via
     /// IERC20Metadata.decimals() -- that call isn't guaranteed by the ERC20
     /// standard and this contract's design has no room for a value that's
@@ -153,12 +160,19 @@ contract BridgeLock {
     /// covenant needs to know or reproduce. See confirmDeposit().
     mapping(bytes32 utxoKey => bytes32 depositId) public utxoConsumedBy;
     uint256 private _depositNonce;
+    /// @dev Block number of the live requestRefund() call for a given depositId, or
+    /// 0 if none is outstanding. See requestRefund()/cancelRefundRequest()/refund().
+    mapping(bytes32 depositId => uint256) public refundRequestedAt;
 
     // -- Events ----------------------------------------------------------------
 
     event DepositLocked(bytes32 indexed depositId, address indexed depositor, uint96 netAmount, bytes20 xecRecipient);
     event DepositRefunded(bytes32 indexed depositId);
     event DepositConfirmed(bytes32 indexed depositId, bytes32 utxoTxid, uint32 utxoIndex);
+    /// @dev The signal an Authorizer monitor is expected to watch for -- see
+    /// requestRefund()'s own doc comment.
+    event RefundRequested(bytes32 indexed depositId, uint256 requestedAtBlock);
+    event RefundRequestCancelled(bytes32 indexed depositId);
     /// @dev `tokenId` is included for off-chain transparency/indexing only -- it is
     /// the burn's self-reported SLP token_id, not something this contract verifies
     /// (see the note on `_parseBurnOpReturn` below for why not).
@@ -195,6 +209,8 @@ contract BridgeLock {
     error HeaderBelowDifficultyFloor();
     error InvalidMerkleProof();
     error ZeroAuthorizer();
+    error RefundNotRequested();
+    error RefundDelayNotElapsed();
 
     constructor(
         IERC20 token_,
@@ -204,7 +220,8 @@ contract BridgeLock {
         uint96 feeAmount_,
         uint32 minConfirmations_,
         bytes8 xecNetworkId_,
-        uint256 minDifficultyTarget_
+        uint256 minDifficultyTarget_,
+        uint256 refundDelay_
     ) {
         // No zero-address check exists anywhere else in this contract for `authorizer`
         // after construction (it's immutable, invariant 4) -- if it were ever left at
@@ -221,6 +238,7 @@ contract BridgeLock {
         minConfirmations = minConfirmations_;
         xecNetworkId = xecNetworkId_;
         minDifficultyTarget = minDifficultyTarget_;
+        refundDelay = refundDelay_;
 
         xecTokenId = sha256(abi.encodePacked(sha256(rawGenesisTx_)));
 
@@ -290,19 +308,78 @@ contract BridgeLock {
         emit DepositLocked(depositId, msg.sender, netAmount, xecRecipient);
     }
 
+    /// @notice Signals intent to refund a not-yet-confirmed deposit, starting a
+    /// `refundDelay`-block cooldown before refund() itself becomes callable (2026-07
+    /// review, defense-in-depth layer against the confirmDeposit()/refund() race --
+    /// see refund()'s own doc comment for exactly what this buys and doesn't buy).
+    /// Moves no funds. Only the depositor may call this, and only before
+    /// confirmation.
+    /// @dev Re-callable: a second call simply restarts the cooldown from the current
+    /// block, it does not revert. Emitting RefundRequested is this function's real
+    /// purpose -- it is the advance-warning signal an Authorizer monitor is expected
+    /// to watch for, which the original single-step refund() never gave it (that
+    /// front-run was instantaneous and unannounced).
+    function requestRefund(bytes32 depositId) external {
+        Deposit storage d = deposits[depositId];
+        if (d.depositor == address(0)) revert UnknownDeposit();
+        if (d.confirmed) revert AlreadyConfirmed();
+        if (d.refunded) revert AlreadyRefunded();
+        if (msg.sender != d.depositor) revert NotDepositor();
+
+        refundRequestedAt[depositId] = block.number;
+        emit RefundRequested(depositId, block.number);
+    }
+
+    /// @notice Withdraws a live refund request without refunding, resetting the
+    /// cooldown to zero. Exists so a depositor who changes their mind (or called
+    /// requestRefund() by mistake) isn't stuck perpetually signalling refund intent
+    /// with no way to retract it -- an un-cancellable request is both a liveness
+    /// problem for the depositor and a stale, misleading signal to any Authorizer
+    /// monitor still treating it as current.
+    /// @dev A subsequent requestRefund() call pays the full `refundDelay` again from
+    /// scratch -- cancelling is not a way to bank cooldown progress.
+    function cancelRefundRequest(bytes32 depositId) external {
+        Deposit storage d = deposits[depositId];
+        if (d.depositor == address(0)) revert UnknownDeposit();
+        if (msg.sender != d.depositor) revert NotDepositor();
+        if (refundRequestedAt[depositId] == 0) revert RefundNotRequested();
+
+        delete refundRequestedAt[depositId];
+        emit RefundRequestCancelled(depositId);
+    }
+
     /// @notice Reclaim a deposit's full original locked amount. Only the original
     /// depositor's own key can do this, and only before it's been confirmed --
     /// confirmation closes this path permanently (invariant 3, `overview.md` `5.`).
+    /// Requires a prior requestRefund() call and at least `refundDelay` blocks to
+    /// have elapsed since it.
     /// @dev `d.netAmount` is now always backed by what deposit() actually measured
     /// itself receiving (audit finding #5, see deposit()'s own doc comment) -- so
     /// `fullAmount` below can never exceed what this specific deposit contributed to
     /// the contract's balance, regardless of `token`'s transfer semantics.
+    ///
+    /// SECURITY-CRITICAL DEPENDENCY (2026-07 review): the requestRefund()/refundDelay
+    /// gate below is a best-effort mitigation, not a structural guarantee -- it only
+    /// helps if the Authorizer's own service is actively watching for
+    /// RefundRequested and reacts within the window (racing its own pending
+    /// confirmDeposit() to land first, or simply declining to sign once a request
+    /// becomes visible). It does not, on its own, close the underlying gap: a
+    /// signature the Authorizer already produced and broadcast *before* ever seeing
+    /// the refund request remains independently valid and usable on XEC regardless
+    /// of what happens here. See confirmDeposit()'s own doc comment and
+    /// `docs/SPEC.md` `III.7` (vault UTXO quarantine) for the actual, structural fix
+    /// -- this delay is additional friction against the race, not a substitute for
+    /// quarantine. Do not treat a passing refundDelay as proof no valid signature is
+    /// outstanding.
     function refund(bytes32 depositId) external {
         Deposit storage d = deposits[depositId];
         if (d.depositor == address(0)) revert UnknownDeposit();
         if (d.confirmed) revert AlreadyConfirmed();
         if (d.refunded) revert AlreadyRefunded();
         if (msg.sender != d.depositor) revert NotDepositor();
+        uint256 requestedAt = refundRequestedAt[depositId];
+        if (requestedAt == 0) revert RefundNotRequested();
+        if (block.number < requestedAt + refundDelay) revert RefundDelayNotElapsed();
 
         d.refunded = true;
 
@@ -326,6 +403,21 @@ contract BridgeLock {
     /// together these close the remaining replay gap: reusing a valid
     /// (utxoTxid, utxoIndex, v, r, s) from one confirmed deposit to also confirm a
     /// second, unrelated one that happens to share the same (xecRecipient, xecAmount).
+    ///
+    /// WHAT THIS FUNCTION DOES NOT AND CANNOT GUARANTEE (2026-07 review, contracts-spec.md
+    /// `2.5`): the (v, r, s) signature checked below is unconditionally valid the
+    /// instant the Authorizer produces it -- true whether or not *this specific call*
+    /// ever succeeds. If it's broadcast (e.g. sitting in a public mempool) before it
+    /// mines, and the deposit's referenced vault UTXO is already spendable on XEC at
+    /// that point, the extracted (v, r, s) is independently sufficient to mint on XEC
+    /// regardless of whether this call goes on to succeed, revert (see refund()'s own
+    /// doc comment), or never mines at all. This contract cannot close that gap --
+    /// Ethereum has no visibility into XEC chain state, by design (`docs/SPEC.md`
+    /// `VI.`, "Independent verifiability"). The required fix is external: the
+    /// Authorizer must never let a confirmation's referenced vault UTXO become
+    /// spendable on XEC before observing this exact call reach Ethereum finality
+    /// (vault UTXO quarantine, `docs/SPEC.md` `III.7`). This is a hard requirement on
+    /// the Authorizer service's implementation, not a suggestion.
     function confirmDeposit(bytes32 depositId, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s) external {
         Deposit storage d = deposits[depositId];
         if (d.depositor == address(0)) revert UnknownDeposit();

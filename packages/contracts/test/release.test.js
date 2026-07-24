@@ -97,7 +97,8 @@ describe('BridgeLock.release()', function () {
       feeAmount,
       3,
       xecNetworkId,
-      ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString())
+      ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString()),
+      20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )
     await bridge.deployed()
 
@@ -247,7 +248,8 @@ describe('BridgeLock.release() with a >9-decimal token (Finding #2/#4 decimal sc
       feeAmount,
       3,
       xecNetworkId,
-      ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString())
+      ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString()),
+      20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )
     await bridge.deployed()
 
@@ -308,7 +310,8 @@ describe('BridgeLock.release() with a <9-decimal token (nano-transaction dust ca
       feeAmount,
       3,
       xecNetworkId,
-      ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString())
+      ethers.BigNumber.from(bitsToTarget(EASY_BITS).toString()),
+      20 // refundDelay -- irrelevant to release()/burn flow, not exercised by this file
     )
     await bridge.deployed()
 
