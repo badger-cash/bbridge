@@ -30,6 +30,7 @@
 &nbsp;&nbsp;&nbsp;&nbsp;[3. Proof and Release](#3-proof-and-release)
 &nbsp;&nbsp;&nbsp;&nbsp;[4. Recipient Derivation](#4-recipient-derivation)
 &nbsp;&nbsp;&nbsp;&nbsp;[5. Proof-of-Work Floor](#5-proof-of-work-floor)
+&nbsp;&nbsp;&nbsp;&nbsp;[6. Postage Deduplication (Authorizer Requirement)](#6-postage-deduplication-authorizer-requirement)
 
 [SECTION V: DATA FORMATS](#section-v-data-formats)
 
@@ -238,6 +239,14 @@ The header supplied in Section IV.3 is checked for internal self-consistency (it
 Release requires both a valid Authorizer signature *and* a header clearing this floor; neither is sufficient alone. The Authorizer's signature remains the primary trust anchor; the proof-of-work floor is a second factor that raises the cost of a fraudulent release in the event that signature is ever compromised or misused, without claiming to independently prove canonical-chain inclusion.
 
 The single-header scoping described above means a self-mined, off-chain header (clearing only the floor, not real network difficulty, and not part of the real chain) is computationally cheap to produce. On its own this doesn't let an attacker forge anything, since they still need a genuine Authorizer postage signature they have no way to fabricate — but combined with ECDSA signature malleability, it once allowed an already-legitimately-postaged burn to be replayed under a self-mined header with a re-encoded (differently-hashed) transaction. Section IV.3 step 7's postage-outpoint tracking (2026-07 review) closes that replay; see that step's own note for the full reasoning.
+
+## 6. Postage Deduplication (Authorizer Requirement)
+
+**This is a mandatory requirement on the Authorizer service's implementation, not an on-chain-enforced control (2026-07 review).** Section IV.3 step 7's postage-outpoint tracking (`stampUtxoConsumedBy`) stops a *single* stamp from backing more than one release — it says nothing about whether the *same underlying burn declaration* (identical input 0, identical OP_RETURN) could legitimately be stamped a second time under a *different, fresh* stamp coin. Nothing in `BridgeLock.sol` can prevent this: the contract has no visibility into whether a given input 0 outpoint corresponds to a real, previously-unspent SLP UTXO, or into the Authorizer service's own request history. An on-chain single-use mapping keyed on input 0's outpoint was considered and rejected for this purpose — it would provide no real protection, since nothing on-chain can distinguish a genuine burn coin's outpoint from one an attacker invents outright (see the note on key compromise below).
+
+**The requirement.** The Authorizer's postage service, before ever cosigning a stamp for a given burn declaration, **must** check whether it has already cosigned a stamp for a declaration with the same input 0 outpoint and the same OP_RETURN content, and refuse to sign a second one. This is a deduplication check the service is already positioned to make — it necessarily inspects input 0's outpoint and the OP_RETURN before deciding whether a burn is legitimate to stamp at all (the "business responsibility" described in Section IV.1) — and closes the gap for the threat model this section actually addresses: an honest Authorizer key, but a bug, race, or malicious resubmission that gets the *same real burn* stamped twice.
+
+**What this does not, and cannot, address.** If the Authorizer's private key is itself compromised, this requirement is moot: an attacker holding that key does not need a second stamp over an *existing* declaration at all. They can fabricate an entirely new input 0 outpoint (any `prevoutHash`, and a fresh `prevoutIndex` for every call — "malleating the UTXO by incrementing the vout" costs nothing), sign it themselves, set the OP_RETURN's attested recipient to their own key, cosign the stamp with the compromised key, and self-mine a header clearing the difficulty floor (Section IV.5) — no on-chain or off-chain deduplication check on *reused* outpoints or declarations has any bearing on a *freshly invented* one every time. Key compromise is already the primary trust anchor this design depends on (Section IV.5's own framing: "the Authorizer's signature remains the primary trust anchor"); nothing short of not compromising that key, or bounding damage via the proof-of-work floor's real cost, defends against it. This section closes a narrower, non-catastrophic gap, not that one.
 
 ---
 
