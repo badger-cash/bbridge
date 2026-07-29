@@ -38,7 +38,7 @@ export interface CovenantCtx {
   realSighash: Buffer
 }
 
-type StackItem = Buffer
+export type StackItem = Buffer
 
 /**
  * There is no eCash script VM available in this repo to execute a compiled
