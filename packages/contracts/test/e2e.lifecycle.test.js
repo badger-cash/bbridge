@@ -5,7 +5,7 @@ const { buildGenesis } = require('./helpers/genesis')
 const { signAuthorization } = require('./helpers/authorization')
 const { sdkRoot, signInput, p2pkhScript, u64be, chainIdToBE32, mineSingleTxHeader, EASY_BITS, bitsToTarget } = require('./helpers/ecash')
 
-const { Address, Coin, KeyRing, Output, Script, bcrypto } = require(sdkRoot + '/node_modules/@hansekontor/checkout-components')
+const { Address, Coin, KeyRing, Output, Script, bcrypto } = require(require.resolve('@hansekontor/checkout-components', { paths: [sdkRoot] }))
 const { PreimageMTX } = require(sdkRoot + '/dist/src/preimage')
 const { mintCovenantV2, mintCovenantV2Ops, buildMintOpReturnV2, buildAuthorizationMessage } = require(sdkRoot + '/dist/src/script')
 const { runCovenant, signDER } = require(sdkRoot + '/dist/src/covenantInterpreter')

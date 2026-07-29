@@ -6,8 +6,13 @@ const bufio = require('bufio')
 // mined block headers) and feed them into BridgeLock.release(). Reached in from
 // packages/sdk directly (not published as a dependency of packages/contracts) --
 // same pattern release.test.js already established.
+//
+// Resolved rather than path-joined: npm hoists a workspace dependency to the root
+// node_modules once more than one package shares it, so assuming it sits nested
+// under packages/sdk breaks as soon as another workspace depends on it too.
+// require.resolve with `paths` finds it either way.
 const sdkRoot = require('path').resolve(__dirname, '../../../sdk')
-const { Script, bcrypto } = require(sdkRoot + '/node_modules/@hansekontor/checkout-components')
+const { Script, bcrypto } = require(require.resolve('@hansekontor/checkout-components', { paths: [sdkRoot] }))
 const { Hash256, secp256k1 } = bcrypto
 
 // tx.signature(...) defaults to Schnorr in this library (64 bytes, not DER) --
