@@ -27,6 +27,7 @@
 [SECTION IV: WITHDRAWAL — XEC TO ETHEREUM](#section-iv-withdrawal--xec-to-ethereum)
 &nbsp;&nbsp;&nbsp;&nbsp;[1. Burn Transaction](#1-burn-transaction)
 &nbsp;&nbsp;&nbsp;&nbsp;[2. Postage](#2-postage)
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[2.1 The Authorizer Must Broadcast the Postaged Burn](#21-the-authorizer-must-broadcast-the-postaged-burn)
 &nbsp;&nbsp;&nbsp;&nbsp;[3. Proof and Release](#3-proof-and-release)
 &nbsp;&nbsp;&nbsp;&nbsp;[4. Recipient Derivation](#4-recipient-derivation)
 &nbsp;&nbsp;&nbsp;&nbsp;[5. Proof-of-Work Floor](#5-proof-of-work-floor)
@@ -66,7 +67,7 @@ This specification covers the protocol's actors, cryptographic message formats, 
 ## 3. Design Invariants
 
 1. At no point does the bridge operator, the Authorizer, or any affiliated party take possession, custody, or control of a user's funds, on either chain.
-2. No party other than the user signs or broadcasts a transaction transmitting the user's value, on the user's behalf, on either chain. (The Authorizer signs a withdrawal transaction's postage input — see Section IV — but that input transmits the Authorizer's own value, not the user's.)
+2. No party other than the user *authorizes* the transmission of the user's value on the user's behalf, on either chain: only the user's own key ever signs an input spending the user's coins. (The Authorizer signs a withdrawal transaction's postage input — see Section IV — but that input transmits the Authorizer's own value, not the user's.) **Relaying** a transaction the user has already constructed and signed is not authorization, and is permitted: the Authorizer broadcasts the vault funding transaction on deposit (Section III.7), and is *required* to be the party that broadcasts a postaged withdrawal, for the reason given in Section IV.2.1.
 3. The Authorizer exercises no discretion over authorization content. On deposit, the content it signs is computed deterministically by the Ethereum Lock Contract from already-recorded, already-public deposit data; the Authorizer's only inputs are a single-use reference and a signature, and it cannot alter the resulting content by varying either. On withdrawal, it signs only its own postage input, never the burn's content.
 4. The Ethereum Lock Contract is immutable and non-upgradable: no administrative key, pause function, or upgrade path exists.
 5. Any protocol fee is fixed at deployment, applied uniformly to every user, and collected atomically within the transaction that moves the rest of the value.
@@ -89,7 +90,9 @@ The wrapped token is deployed once per bridged asset as an SLP Token Type 2 toke
 
 Per the SLP Token Type 2 specification, a `MINT` transaction is valid only in a block subsequent to the block containing its `GENESIS` transaction. The first deposit for a newly-deployed asset cannot be minted until `GENESIS` has confirmed.
 
-Type 2's MINT Vault model permits any UTXO held at the vault's P2SH address to authorize a mint; unlike Type 1's MINT Baton, no mint is required to recreate or pass forward a specific UTXO. The vault address must independently be kept funded with enough spendable UTXOs to support the volume of concurrent mints expected; this is an operational funding concern, not a protocol requirement — subject to the vault UTXO quarantine requirement (Section III.7): whenever a vault UTXO is funded specifically to back a not-yet-confirmed deposit's authorization, its funding transaction must not be broadcast until that confirmation has landed, whether it's funded singly or as part of a batch.
+Type 2's MINT Vault model permits any UTXO held at the vault's P2SH address to authorize a mint; unlike Type 1's MINT Baton, no mint is required to recreate or pass forward a specific UTXO. Each mint simply consumes the vault UTXO its authorization names and creates no replacement (Section III.6).
+
+That freedom does not, however, extend to backing confirmations from a standing inventory of vault UTXOs. The vault UTXO quarantine requirement (Section III.7) forbids the Authorizer from referencing any coin that already exists and is already spendable at the moment its signature becomes observable. Every vault UTXO a confirmation names must therefore be brought into existence *on demand*, by a funding transaction constructed for that specific confirmation and held unbroadcast until it reaches finality — whether funded singly or as part of a batch. Pre-funding the vault address ahead of demand does not help and is not what "keeping the vault funded" means here: coins sitting at the vault address in advance can never legitimately be referenced by a confirmation, and would only be idle capital. What must actually be kept solvent is the Authorizer's own funding source for those on-demand transactions — an operational concern of the Authorizer service, not a property of the vault address (see [`authorizer-spec.md`](authorizer-spec.md) §4.1).
 
 ---
 
@@ -167,7 +170,7 @@ Spending the covenant requires, as witness items: the minter's own signature and
 4. Extracts this spend's real `hashOutputs` from the preimage's fixed trailer and requires it to double-SHA256-match the signed `txOutputs` — proving this spend's real outputs are exactly what was authorized, no more and no less (a vault self-replenishment change output is not supported by this version; see Appendix A).
 5. Performs a final, standard `OP_CHECKSIG` against the real, VM-computed sighash of the transaction actually being broadcast, reusing the *same* minter signature bytes already verified against the supplied preimage in step 2 — since one ECDSA signature cannot validly verify against two different messages, this proves the preimage supplied in step 2 genuinely describes the transaction being broadcast, not independently fabricated bytes.
 
-Only the constructing party's own key signs this transaction; the Authorizer never broadcasts anything to XEC; its signature and the content it covers come entirely from Ethereum.
+Only the constructing party's own key signs this transaction; the Authorizer's signature and the content it covers come entirely from Ethereum, and it never signs an input spending anyone else's coins. (It does broadcast to XEC — the vault funding transaction is its own, and Section III.7 requires it to control that broadcast's timing — but it authorizes nothing here that Ethereum did not already determine.)
 
 ## 7. Vault UTXO Quarantine (Authorizer Requirement)
 
@@ -202,6 +205,26 @@ The user constructs a transaction spending their wrapped-token UTXO(s), with:
 ## 2. Postage
 
 Because SLP inputs and outputs are pegged to the network dust value, the transaction constructed in Section IV.1 does not by itself carry enough value to cover its own miner fee. The Authorizer appends one or more of its own XEC inputs ("stamp" inputs) to cover the fee, signing them with `SIGHASH_ALL | SIGHASH_FORKID`. The Authorizer's signature covers only its own stamp input; it neither alters nor signs the user's burn input or the OP_RETURN content.
+
+## 2.1 The Authorizer Must Broadcast the Postaged Burn
+
+**The Authorizer broadcasts the completed transaction itself and never returns it to the requester.** This is a requirement, not an interface preference, and the reason is that a postaged burn which XEC would *reject* is worth as much to an attacker as one it accepts.
+
+`release()` verifies signatures, format, a difficulty floor and a Merkle proof, but it has no view of XEC's UTXO set. It cannot determine whether input 0's coin ever existed or had already been spent — normally XEC consensus guarantees that, but the header check here is deliberately only a self-consistency and difficulty test, not proof of canonical-chain inclusion (Section IV.5), and a header clearing that floor is cheap to produce.
+
+So a stamped transaction that XEC would refuse still contains everything `release()` needs:
+
+- Input 0's signature verifies, since signing a spend of a nonexistent or already-spent coin is perfectly possible.
+- The postage signature is genuine.
+- The holder self-mines a conforming header and builds a Merkle proof over their own block.
+
+That is a full release against fabricated collateral, obtained with no key compromise — the same capability Section IV.6 otherwise reserves for an attacker holding the Authorizer's key.
+
+Validating before signing does not close this. The Authorizer can confirm input 0's coin exists and is unspent, and should, but the requester may spend that coin in a conflicting transaction immediately afterwards; the stamp is then permanently invalid on XEC and entirely sufficient for a release. No check performed before signing can bind a coin that is still spendable after it.
+
+Broadcasting closes it. XEC is a Bitcoin-family network: an invalid transaction is rejected by the receiving node and never enters a mempool or relays, so it reaches nobody. If a conflicting spend won the race, the Authorizer's broadcast simply fails and the requester is handed nothing. The pre-signing checks remain worthwhile as defense in depth, but consensus — not the Authorizer's diligence — is what makes a stamp over an invalid burn unreachable.
+
+This is why invariant 2 distinguishes authorizing from relaying. The Authorizer signs only its own stamp input, but it must be the party that broadcasts.
 
 ## 3. Proof and Release
 
@@ -333,7 +356,7 @@ The following parameters and formats are implemented with provisional values or 
 - **Deployment scope.** One Lock Contract per bridged asset is assumed throughout; a multi-asset contract is not specified.
 - **BURN OP_RETURN compatibility.** The layout in Section V has not been validated against third-party SLP indexing tooling.
 - **Gas cost of withdrawal processing.** Not yet measured against a target ceiling; `BridgeLock.sol` needed `viaIR: true` to compile at all, a signal this code does enough work that a real measurement matters before relying on it.
-- **Authorizer service specification.** Not yet written; key management, deposit-watching, and postage-UTXO management are unspecified. One load-bearing piece of its required behavior *is* specified despite the service itself not existing yet: vault UTXO quarantine (Section III.7) — any implementation must follow it, since the refund/confirmation race it closes is otherwise live regardless of anything else the service does.
+- **Authorizer service specification.** Now written — see [`authorizer-spec.md`](authorizer-spec.md), which specifies the deposit state machine (including how vault UTXO quarantine, Section III.7, survives a crash at each edge), the reserve-pool funding model that makes quarantine implementable without chained unbroadcast transactions, postage co-signing and deduplication, and key-role separation. What remains unfixed there is deployment-level rather than protocol-level: persistence engine, service topology, and the gas policy for a `confirmDeposit()` that fails to mine.
 - **Merkle-proof key rotation.** The [SLP self-mint protocol](https://github.com/badger-cash/slp-self-mint-protocol)'s Token Type 2 format includes an optional Merkle-proof extension permitting the Authorizer's eCash-side key to rotate independently of a single static public key. `mintCovenantV2` (Section III.6) deliberately does not implement it in this version, since the Ethereum Lock Contract's own `authorizer` is a single immutable address with no rotation mechanism — rotating only the eCash side would not, by itself, enable real key rotation. A future version intended to support rotation needs a matching mechanism on both sides.
 - **No first-class burn/postage transaction builder in `packages/sdk` yet.** The withdrawal-side transaction (Section IV.1–2) is constructed and proven correct against a deployed `BridgeLock.release()` in `packages/contracts`' own test suite (`test/release.test.js`, `test/e2e.lifecycle.test.js`), using eCash primitives directly — but `packages/sdk` does not yet export a dedicated function for building it, unlike the deposit-side mint transaction (`mintCovenantV2`, Section III.6).
 
@@ -341,6 +364,7 @@ The following parameters and formats are implemented with provisional values or 
 
 # Appendix B: Related Documents
 
+- [`authorizer-spec.md`](authorizer-spec.md) — the Authorizer service specification: ports, deposit state machine, crash-recovery obligations, postage co-signing, and key-role separation. Normative for any implementation of the service, and the place Sections III.7 and IV.6's "Authorizer Requirement" language is turned into a concrete procedure.
 - [`overview.md`](overview.md) and [`contracts-spec.md`](contracts-spec.md) — the design-rationale documents this specification was consolidated from. They retain material not reproduced here: the reasoning behind specific design choices, corrections made during implementation and why, and a running list of open questions as they were encountered. Consult them for *why*; consult this document for *what*.
 - `packages/sdk/README.md` and `packages/contracts/README.md` — implementation-level reference documentation for the two reference implementations.
 - The no-action-letter application draft — the legal analysis this architecture is designed to support. Not reproduced or superseded by this document.

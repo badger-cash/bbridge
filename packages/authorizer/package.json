@@ -1,0 +1,21 @@
+{
+  "name": "@bbridge/authorizer",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Reference implementation of the bbridge Authorizer service core: deposit confirmation with vault UTXO quarantine, and withdrawal postage co-signing",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test"
+  },
+  "dependencies": {
+    "@bbridge/sdk": "0.0.0",
+    "@hansekontor/checkout-components": "1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.130",
+    "typescript": "^7.0.2"
+  }
+}
