@@ -1,6 +1,7 @@
 # Specification documents
 
 - [**SPEC.md**](SPEC.md) — the formal protocol specification. Authoritative reference for actors, invariants, message formats, and the deposit/withdrawal procedures. Start here.
+- [**authorizer-spec.md**](authorizer-spec.md) — the Authorizer service's specification, filling the gap `SPEC.md` Appendix A left open. Normative, not rationale: the four service obligations and which of them nothing on either chain enforces, the deposit state machine with its crash-recovery behaviour defined per edge, the withdrawal postage rules, and discretionary issuance bounded by headroom. Implemented by `packages/authorizer`.
 
 ## Design rationale (historical)
 
