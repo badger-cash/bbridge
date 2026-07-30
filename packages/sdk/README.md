@@ -4,13 +4,15 @@ Reference TypeScript implementation of the eCash-side transaction logic for the 
 
 ## Status
 
-Functional and tested: `npm test` compiles and runs 35 passing cases. Covers eCash-side primitives only — attestation construction/parsing, both self-mint covenant versions (the legacy `mintOutscript` and the current `mintCovenantV2`), genesis/mint transaction construction, and Merkle proof construction. `mintCovenantV2` is exercised via a small, opcode-faithful interpreter (`src/covenantInterpreter.ts`) rather than a real eCash script VM, since none is available in this repo — see that module's own doc comment for how it stays honest against the real interpreter's opcode semantics. It's also cross-tested against a real, deployed `BridgeLock.sol` in `packages/contracts`' `test/e2e.lifecycle.test.js` — the same authorizer signature bytes that contract's `confirmDeposit()` verifies via `ecrecover` are fed, re-encoded to DER, into a real `mintCovenantV2` execution. Does not include chain connectivity, an Ethereum-side client, or an authorizer service; see [`docs/SPEC.md`](../../docs/SPEC.md) §4 for the full component map.
+Functional and tested: `npm test` compiles and runs 35 passing cases. Covers eCash-side primitives only — attestation construction/parsing, both self-mint covenant versions (the legacy `mintOutscript` and the current `mintCovenantV2`), genesis/mint transaction construction, and Merkle proof construction. `mintCovenantV2` is exercised via a small, opcode-faithful interpreter (`src/covenantInterpreter.ts`) rather than a real eCash script VM, since none is available in this repo — see that module's own doc comment for how it stays honest against the real interpreter's opcode semantics. It's also cross-tested against a real, deployed `BridgeLock.sol` in `packages/contracts`' `test/e2e.lifecycle.test.js` — the same authorizer signature bytes that contract's `confirmDeposit()` verifies via `ecrecover` are fed, re-encoded to DER, into a real `mintCovenantV2` execution. Does not include chain connectivity or an Ethereum-side client; see [`docs/SPEC.md`](../../docs/SPEC.md) §4 for the full component map. The Authorizer service core that builds on this lives in [`@bbridge/authorizer`](../authorizer/).
 
 ## Installation
 
 ```
-npm install
+npm install @bbridge/sdk @hansekontor/checkout-components
 ```
+
+The second is a peer dependency and must be installed alongside — see below for why it is not bundled.
 
 ## Design
 
@@ -34,9 +36,19 @@ A host application may hold any number of `BridgeAssetConfig` values concurrentl
 
 `@hansekontor/checkout-components` ships no TypeScript types. `src/types/checkout-components.d.ts` provides a hand-written ambient declaration covering the surface this package actually uses (and that dependency's own untyped dependencies, `bufio`, `bsert`, `n64`).
 
-### Dependency pin
+### The checkout-components peer dependency
 
-`@hansekontor/checkout-components` is pinned to `1.1.0` exactly, not the newer `1.3.0`. The `1.3.0` rollup-bundled build expects a global `crypto.getRandomValues`, unavailable unflagged on Node 18 (this package's target runtime; that global only became stable in Node ≥19/20). `1.1.0` does not exercise that code path.
+`@hansekontor/checkout-components` is a **peer** dependency, ranged `>=1.0.1 <1.3.0`, and is not bundled.
+
+A peer rather than a direct dependency because this package's whole API surface passes that library's own objects (`Script`, `MTX`, `Coin`) back and forth with its host. Two copies in one tree means `instanceof` fails across the boundary, which surfaces as baffling errors far from the cause. One copy, shared.
+
+The upper bound excludes `1.3.0`: its rollup-bundled build expects a global `crypto.getRandomValues`, unavailable unflagged on Node 18 (this package's target runtime; that global only became stable on Node ≥19/20). The lower bound admits `1.0.1` because at least one consumer resolves that name to a fork of it rather than the registry build. Both ends are verified rather than assumed — `mintCovenantV2`, `buildAuthorizationMessage` and `buildMintV2TxOutputs` produce byte-identical output under `1.0.1` and `1.1.0`.
+
+### Shipped type declarations
+
+`@hansekontor/checkout-components` ships no types; `src/types/checkout-components.d.ts` supplies them, and it is the single such declaration for the whole monorepo. A second copy elsewhere would not merge with it — two `declare module` blocks for one specifier means one silently wins — so `packages/authorizer` deliberately has none of its own and inherits this one.
+
+Getting that to reach a consumer takes a post-build step (`scripts/copy-ambient-types.js`): `tsc` neither copies `.d.ts` *inputs* to `outDir` nor preserves a triple-slash reference from a file that only re-exports. Without it, every emitted declaration that imports from that module fails with TS7016. `npm test` and `npm run build` both run it; a bare `tsc` does not.
 
 ## API Reference
 
