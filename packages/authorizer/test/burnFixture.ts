@@ -78,6 +78,8 @@ export interface BurnTxOptions extends BurnFields {
   prevoutIndex?: number
   /** Extra token inputs, as a wallet that consolidated inside the burn would produce. */
   extraInputs?: number
+  /** Extra P2PKH outputs beyond the OP_RETURN, as a burner splitting change would add. */
+  extraOutputs?: number
 }
 
 export interface BurnTx {
@@ -109,6 +111,11 @@ export function buildBurnTx(options: BurnTxOptions = {}): BurnTx {
   }
 
   mtx.addOutput(Script.fromRaw(burnOpReturnScript(options)), 0)
+
+  // Also before signing: input 0 commits to the output set, so a burn reaching the
+  // service already has whatever outputs its author chose, and we cannot drop any.
+  for (let i = 0; i < (options.extraOutputs ?? 0); i++)
+    mtx.addOutput(prevoutScript, 546)
 
   const type = options.sighashType ?? BURN_SIGHASH
   const pubkey = signer.getPublicKey()

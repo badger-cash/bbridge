@@ -6,7 +6,7 @@ Transport-free and storage-free. No HTTP, no database, no key material, no chain
 
 ## Status
 
-Functional and tested: `npm test` compiles and runs 71 passing cases against in-memory fakes. Covers the deposit state machine and every one of its edges, authorization message construction and signing, headroom reservation and reconciliation, burn OP_RETURN parsing, and postage co-signing including each refusal path. Does not include a scheduler, an HTTP layer, or any port implementation — see Ports below.
+Functional and tested: `npm test` compiles and runs 75 passing cases against in-memory fakes. Covers the deposit state machine and every one of its edges, authorization message construction and signing, headroom reservation and reconciliation, burn OP_RETURN parsing, and postage co-signing including each refusal path. Does not include a scheduler, an HTTP layer, or any port implementation — see Ports below.
 
 ## Installation
 
@@ -68,9 +68,11 @@ const { txid, burnQuantity } = await coSignPostage(
 )
 ```
 
-`coSignPostage` throws `PostageError` with a `code` on every refusal (`MALFORMED`, `WRONG_DEPLOYMENT`, `BAD_BURN_INPUT`, `SCHNORR_SIGNATURE`, `UNKNOWN_PREVOUT`, `SLP_INVALID`, `BELOW_MINIMUM`, `ALREADY_STAMPED`, `NO_STAMP_AVAILABLE`, `REJECTED`). None of them leak anything the caller did not already submit, so they are safe to report back to a user.
+`coSignPostage` throws `PostageError` with a `code` on every refusal (`MALFORMED`, `WRONG_DEPLOYMENT`, `BAD_BURN_INPUT`, `BAD_BURN_OUTPUTS`, `SCHNORR_SIGNATURE`, `UNKNOWN_PREVOUT`, `SLP_INVALID`, `BELOW_MINIMUM`, `ALREADY_STAMPED`, `NO_STAMP_AVAILABLE`, `REJECTED`). None of them leak anything the caller did not already submit, so they are safe to report back to a user.
 
-A burn must carry **exactly one input**. `release()` reads the burn from `inputs[0]` and the postage from `inputs[1]` by index, so the stamp has to land at index 1 — a second token input would push it to index 2 and leave the contract checking the requester's own input for the Authorizer's signature. A holder consolidating dust UTXOs does so in a separate transaction first, which needs no postage: each 546-sat input adds about 148 bytes of fee but brings 546 sats with it.
+A burn must carry **exactly one input**, and at most two outputs. `release()` reads the burn from `inputs[0]` and the postage from `inputs[1]` by index, so the stamp has to land at index 1 — a second token input would push it to index 2 and leave the contract checking the requester's own input for the Authorizer's signature. A holder consolidating dust UTXOs does so in a separate transaction first, which needs no postage: each 546-sat input adds about 148 bytes of fee but brings 546 sats with it.
+
+The output limit is the BURN OP_RETURN plus one change output. `release()` parses the whole raw transaction on chain — it walks every output copying each script byte by byte, then serialises the output set again for the sighash — so gas grows with the transaction while the payout does not. Nothing in the contract bounds it, and by the time a burner discovers their transaction is too expensive to release, the tokens are already destroyed.
 
 It returns a `txid`, never the raw stamped bytes. The service broadcasts, and the completed transaction never leaves it unbroadcast — a stamp over a burn XEC would reject is enough for a full release under a self-mined header, and consensus rejecting it at the node is what keeps it out of an attacker's hands (`SPEC.md` §IV.2.1).
 

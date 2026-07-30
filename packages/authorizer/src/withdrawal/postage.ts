@@ -29,6 +29,7 @@ export type PostageRefusal =
   | 'MALFORMED'
   | 'WRONG_DEPLOYMENT'
   | 'BAD_BURN_INPUT'
+  | 'BAD_BURN_OUTPUTS'
   | 'SCHNORR_SIGNATURE'
   | 'UNKNOWN_PREVOUT'
   | 'SLP_INVALID'
@@ -63,6 +64,9 @@ const BURN_SIGHASH = 0x01 | 0x40 | 0x80
 /** Bytes a P2PKH input adds: 32 txid + 4 index + 1 len + ~107 scriptSig + 4 sequence. */
 const P2PKH_INPUT_SIZE = 148
 
+/** The BURN OP_RETURN at index 0, plus one change output. See assertBurnOutputs. */
+const MAX_BURN_OUTPUTS = 2
+
 /**
  * Validates a user-submitted burn and returns it with the Authorizer's stamp
  * attached and signed.
@@ -77,12 +81,13 @@ export async function coSignPostage(deps: PostageDeps, rawTxHex: string): Promis
   const burn = parseOutputZero(tx)
 
   assertMatchesDeployment(config, burn)
+  assertBurnOutputs(tx)
   assertValidBurnInput(tx, burn)
   await assertBurnInputSpendable(ecash, tx)
   await assertSlpValid(slp, config, rawTxHex, burn)
   assertAboveMinimum(config, burn)
 
-  // §5 step 6: claim BEFORE signing, atomically. A check after signing does not
+  // §5 step 7: claim BEFORE signing, atomically. A check after signing does not
   // close the honest-key double-stamp of Section IV.6.
   const outpoint = burnOutpoint(tx)
   const opReturnHex = tx.outputs[0].script.toRaw().toString('hex')
@@ -193,6 +198,36 @@ function parseOutputZero(tx: TX): BurnOpReturn {
 }
 
 /**
+ * The BURN OP_RETURN, and at most one output beyond it.
+ *
+ * A burn destroys the tokens, so there is nothing for a second, third or hundredth
+ * output to carry except leftover satoshis -- one change output covers that. The
+ * limit exists because `release()` parses the whole raw transaction on chain:
+ * `EcashTx.parse` walks every output and copies its script byte by byte, and the
+ * sighash reconstruction serialises the output set a second time. Gas grows with the
+ * transaction, and nothing in the contract bounds it, so a burner spending a
+ * well-funded UTXO into a long output list can produce a burn that costs more to
+ * release than it pays out, or cannot be released within a block at all -- with the
+ * tokens already destroyed by the time they find out.
+ *
+ * `requiredStampSats` bounds the transaction's size too, since the stamp pays the
+ * whole fee and `fetchStamp` refuses when no coin is large enough. That is a real
+ * backstop but a poor primary check: it moves with the fee rate and the pool's
+ * denomination, it is invisible to anyone reading this file, and it reports itself as
+ * NO_STAMP_AVAILABLE -- which tells the requester to retry later, when in truth no
+ * retry of those bytes can ever succeed.
+ */
+function assertBurnOutputs(tx: TX): void {
+  if (tx.outputs.length > MAX_BURN_OUTPUTS)
+    throw new PostageError(
+      'BAD_BURN_OUTPUTS',
+      `A burn may carry the BURN OP_RETURN and at most one change output, found ` +
+      `${tx.outputs.length}. release() parses every output on chain, so a longer ` +
+      'output list raises the gas to release this burn without changing what it pays.'
+    )
+}
+
+/**
  * §5 step 2. Mirrors release()'s own checks so a mismatch is a clean refusal here
  * rather than a burn that confirms on XEC and then reverts on Ethereum -- which
  * would destroy the user's tokens with no release.
@@ -218,7 +253,7 @@ function assertMatchesDeployment(config: AuthorizerConfig, burn: BurnOpReturn): 
 }
 
 /**
- * §5 step 3. Input 0 must be a standard P2PKH spend signed
+ * §5 step 4. Input 0 must be a standard P2PKH spend signed
  * SIGHASH_ALL|FORKID|ANYONECANPAY, and the key that signed it must hash to the
  * OP_RETURN's attested recipient.
  *
@@ -229,7 +264,7 @@ function assertMatchesDeployment(config: AuthorizerConfig, burn: BurnOpReturn): 
  */
 function assertValidBurnInput(tx: TX, burn: BurnOpReturn): void {
   // Exactly one, not merely at least one. release() reads the burn from inputs[0] and
-  // the postage from inputs[1] by index, so §5 step 7's "exactly one stamp input, at
+  // the postage from inputs[1] by index, so §5 step 8's "exactly one stamp input, at
   // index 1" only holds if the requester supplied exactly one of their own -- a second
   // token input pushes the stamp to index 2 and leaves _verifyStampInput checking the
   // requester's own input for the Authorizer's signature.

@@ -160,6 +160,42 @@ test('assetId is compared left-padded, as Solidity widens an address', async () 
   await coSignPostage(ok, knownBurn(ok).rawTxHex)
 })
 
+/* ----------------------------------------------------------- burn output checks */
+
+test('a burn may carry the OP_RETURN and one change output', async () => {
+  // The burner signs the output set before we see it, so change is theirs to add.
+  const h = harness()
+  await coSignPostage(h, knownBurn(h, { extraOutputs: 1 }).rawTxHex)
+  assert.equal(h.stamps.signCalls, 1)
+})
+
+test('a burn with a long output list is refused', async () => {
+  // release() walks every output on chain and copies each script byte by byte, then
+  // the sighash reconstruction serialises them again. A burner spending a well-funded
+  // UTXO into a long output list can produce a burn that costs more to release than it
+  // pays out - with the tokens already destroyed by the time they find out.
+  const h = harness()
+  await refuses(h, knownBurn(h, { extraOutputs: 20 }).rawTxHex, 'BAD_BURN_OUTPUTS')
+})
+
+test('the output limit is refused as a 400, not as an empty stamp pool', async () => {
+  // requiredStampSats bounds the size too, since the stamp pays the whole fee - but it
+  // reports NO_STAMP_AVAILABLE, which tells the requester to retry later when no retry
+  // of those bytes can ever succeed. This check has to run first for that reason.
+  const h = harness()
+  h.stamps.available = null
+
+  await refuses(h, knownBurn(h, { extraOutputs: 20 }).rawTxHex, 'BAD_BURN_OUTPUTS')
+})
+
+test('an over-long burn is refused before the claim is taken', async () => {
+  const h = harness()
+  await refuses(h, knownBurn(h, { extraOutputs: 5 }).rawTxHex, 'BAD_BURN_OUTPUTS')
+
+  assert.equal(h.store.burnClaims.size, 0, 'no claim was taken')
+  assert.equal(h.stamps.signCalls, 0)
+})
+
 /* ------------------------------------------------------------ burn input checks */
 
 test('input 0 must carry ANYONECANPAY so a stamp can be appended', async () => {
