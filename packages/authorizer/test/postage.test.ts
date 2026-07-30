@@ -179,6 +179,47 @@ test('a non-P2PKH input 0 is refused', async () => {
   await refuses(h, knownBurn(h, { scriptSig: Buffer.from([0x51]) }).rawTxHex, 'BAD_BURN_INPUT')
 })
 
+test('a burn carrying more than one input is refused', async () => {
+  // release() reads the postage from inputs[1] by index. A second token input pushes
+  // the stamp to index 2, and _verifyStampInput then checks the requester's own input
+  // for the Authorizer's signature -- so this confirms on XEC and never releases.
+  const h = harness()
+  await refuses(h, knownBurn(h, { extraInputs: 1 }).rawTxHex, 'BAD_BURN_INPUT')
+})
+
+test('a multi-input burn is refused before the claim is taken', async () => {
+  // The whole point of checking this structurally. The StampSource's own guard runs
+  // after the claim, and appending's failure path holds the claim rather than
+  // releasing it -- so refusing there would mark this outpoint stamped for good, and
+  // every corrected retry would come back ALREADY_STAMPED. The requester's only way
+  // out would be paying for a transaction to move the coin to a fresh outpoint.
+  const h = harness()
+  await refuses(h, knownBurn(h, { extraInputs: 2 }).rawTxHex, 'BAD_BURN_INPUT')
+
+  assert.equal(h.store.burnClaims.size, 0, 'no claim was taken')
+  assert.equal(h.stamps.signCalls, 0)
+
+  const retry = harness()
+  await coSignPostage(retry, knownBurn(retry).rawTxHex)
+  assert.equal(retry.stamps.signCalls, 1, 'the user can retry once they consolidate first')
+})
+
+test('an input-count refusal says a consolidation is needed', async () => {
+  // Postage is a hard gate, so a refusal has to tell the requester what to do about
+  // it: consolidate in a separate transaction, not inside the burn.
+  const h = harness()
+
+  await assert.rejects(
+    () => coSignPostage(h, knownBurn(h, { extraInputs: 1 }).rawTxHex),
+    (error: unknown) => {
+      assert.ok(error instanceof PostageError)
+      assert.match(error.message, /exactly one input, found 2/)
+      assert.match(error.message, /consolidated in a separate transaction/)
+      return true
+    }
+  )
+})
+
 /* ------------------------------------------------- prevout-backed verification */
 
 test('a Schnorr-signed burn is refused, because ecrecover is ECDSA-only', async () => {

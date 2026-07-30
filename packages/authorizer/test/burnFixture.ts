@@ -76,6 +76,8 @@ export interface BurnTxOptions extends BurnFields {
   /** Replace input 0's scriptSig entirely, for the non-P2PKH case. */
   scriptSig?: Buffer
   prevoutIndex?: number
+  /** Extra token inputs, as a wallet that consolidated inside the burn would produce. */
+  extraInputs?: number
 }
 
 export interface BurnTx {
@@ -97,6 +99,15 @@ export function buildBurnTx(options: BurnTxOptions = {}): BurnTx {
   mtx.addCoin(
     new Coin({ hash: prevoutHash, index: prevoutIndex, value: PREVOUT_VALUE, script: prevoutScript })
   )
+  // Added before signing so input 0's sighash is the one this transaction really has.
+  // ANYONECANPAY means it would verify either way, which is exactly why a burn like
+  // this reaches the service looking plausible.
+  for (let i = 0; i < (options.extraInputs ?? 0); i++) {
+    mtx.addCoin(
+      new Coin({ hash: Buffer.alloc(32, 0xcd), index: i, value: PREVOUT_VALUE, script: prevoutScript })
+    )
+  }
+
   mtx.addOutput(Script.fromRaw(burnOpReturnScript(options)), 0)
 
   const type = options.sighashType ?? BURN_SIGHASH
