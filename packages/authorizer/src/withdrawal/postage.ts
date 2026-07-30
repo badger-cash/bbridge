@@ -228,8 +228,26 @@ function assertMatchesDeployment(config: AuthorizerConfig, burn: BurnOpReturn): 
  * under their own key and redirect the release.
  */
 function assertValidBurnInput(tx: TX, burn: BurnOpReturn): void {
-  if (tx.inputs.length === 0)
-    throw new PostageError('BAD_BURN_INPUT', 'Transaction has no inputs')
+  // Exactly one, not merely at least one. release() reads the burn from inputs[0] and
+  // the postage from inputs[1] by index, so §5 step 7's "exactly one stamp input, at
+  // index 1" only holds if the requester supplied exactly one of their own -- a second
+  // token input pushes the stamp to index 2 and leaves _verifyStampInput checking the
+  // requester's own input for the Authorizer's signature.
+  //
+  // Checked here, in the structural pass, rather than left to the StampSource's own
+  // guard. That one runs after the dedup claim, and the claim is deliberately held
+  // rather than released when appending fails, because a stamp that may exist anywhere
+  // is enough for a release (Section IV.6). So a structurally impossible transaction
+  // would mark its outpoint stamped for good and every corrected retry would come back
+  // ALREADY_STAMPED -- recoverable only by moving the coin to a fresh outpoint, which
+  // is a transaction the requester should not have to pay for to fix a 400.
+  if (tx.inputs.length !== 1)
+    throw new PostageError(
+      'BAD_BURN_INPUT',
+      `A burn must have exactly one input, found ${tx.inputs.length}. The Authorizer's ` +
+      'stamp is appended at index 1, so token UTXOs have to be consolidated in a ' +
+      'separate transaction before the burn is built.'
+    )
 
   const code = tx.inputs[0].script.code
   if (code.length !== 2 || !code[0].data || !code[1].data)
