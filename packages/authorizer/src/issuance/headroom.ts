@@ -26,12 +26,25 @@ export function collateralToXecUnits(
 }
 
 /**
- * headroom = current collateral (in XEC units) - circulating supply.
+ * headroom = collateral (in XEC units) - circulating supply - burned but unreleased.
  *
  * Zero is the correct default: in a bridge doing nothing but its own business, every
  * confirmed deposit mints an equal amount and every withdrawal burn releases an equal
- * amount, so the two terms track exactly. Headroom is nonzero only where someone
+ * amount, so the terms track exactly. Headroom is nonzero only where someone
  * deliberately created it (§6.2).
+ *
+ * **The third term is not a refinement, it closes a hole.** Collateral and supply do
+ * not move together on a withdrawal: the burn destroys tokens on XEC at one moment and
+ * `release()` removes the collateral at another, and `release()` is permissionless and
+ * user-submitted (`overview.md` §6 step 3), so the burner chooses how far apart those
+ * moments are. Between them, `collateral - supply` reads high by exactly the burn
+ * amount -- and a burner who issues against that inflated figure before submitting
+ * their own release proof leaves supply backed by less collateral than it was. Every
+ * step of that is individually valid, which is why nothing else catches it.
+ *
+ * Subtracting the burns that have not yet been released cancels the transient exactly.
+ * A burn that is never released holds its term open forever, which is the conservative
+ * direction and matches the fact that its collateral has not moved either.
  *
  * May legitimately be negative if supply has outrun collateral, which is a halt
  * condition rather than a number to clamp -- see assertHeadroomSolvent.
@@ -39,14 +52,18 @@ export function collateralToXecUnits(
 export async function computeHeadroom(
   config: AuthorizerConfig,
   eth: Pick<EthereumReader, 'getLockedCollateral'>,
-  slp: Pick<SlpValidator, 'getCirculatingSupply'>
+  slp: Pick<SlpValidator, 'getCirculatingSupply'>,
+  store: Pick<Store, 'getUnreleasedBurnQuantity'>
 ): Promise<bigint> {
-  const [collateral, supply] = await Promise.all([
+  const [collateral, supply, unreleased] = await Promise.all([
     eth.getLockedCollateral(),
-    slp.getCirculatingSupply(config.xecTokenId)
+    slp.getCirculatingSupply(config.xecTokenId),
+    store.getUnreleasedBurnQuantity()
   ])
 
-  return collateralToXecUnits(collateral, config.tokenDecimals, config.xecDecimals) - supply
+  return collateralToXecUnits(collateral, config.tokenDecimals, config.xecDecimals)
+    - supply
+    - unreleased
 }
 
 export class HeadroomError extends Error {}
@@ -139,17 +156,43 @@ export async function reserveIssuance(
  * Recomputes headroom from both chains and overwrites the durable balance (§6.3).
  *
  * The balance is a projection and drifts, so this runs on a schedule rather than at
- * issuance time. It refuses to write an insolvent figure: negative headroom means
- * some holder is already unbacked, which needs a human rather than a smaller number.
+ * issuance time. It refuses to write an insolvent figure: negative headroom means some
+ * holder is already unbacked, which needs a human rather than a smaller number.
+ *
+ * **What is written is the bound minus what is already spoken for.** An issuance that
+ * has been signed but whose mint has not yet confirmed is not in `getCirculatingSupply`
+ * yet, so a reconcile that wrote the raw bound would overwrite that reservation and
+ * hand the same capacity out a second time -- undoing exactly what §6.3's "reserved
+ * durably at signing time, not recomputed per request" exists to guarantee. §6.3 names
+ * the widening factor itself: the indexer lags the chain, so the window is wider than
+ * request timing alone suggests, and a scheduled reconcile is as exposed to it as a
+ * per-request recomputation would be.
+ *
+ * Outstanding reservations are the store's to define. The sound reading is "signed, and
+ * not yet observable in supply" -- so a reservation stays outstanding until the vault
+ * UTXO its authorization names is seen spent, and is subtracted until then.
  */
 export async function reconcileHeadroom(
   config: AuthorizerConfig,
   eth: Pick<EthereumReader, 'getLockedCollateral'>,
   slp: Pick<SlpValidator, 'getCirculatingSupply'>,
-  store: Pick<Store, 'setHeadroom'>
+  store: Pick<Store, 'setHeadroom' | 'getUnreleasedBurnQuantity' | 'getOutstandingReservations'>
 ): Promise<bigint> {
-  const headroom = await computeHeadroom(config, eth, slp)
-  assertHeadroomSolvent(headroom)
-  await store.setHeadroom(headroom)
-  return headroom
+  const bound = await computeHeadroom(config, eth, slp, store)
+
+  // Solvency is a property of the bound, not of what is left after reservations: a
+  // positive bound fully committed to pending issuance is a full bridge, not a broken
+  // one, and halting on it would be wrong.
+  assertHeadroomSolvent(bound)
+
+  const outstanding = await store.getOutstandingReservations()
+  const balance = bound - outstanding
+
+  // Clamped, unlike the bound. Reservations exceeding the bound means issuance was
+  // signed against capacity that has since been revalued down - the signatures exist
+  // and cannot be recalled, so the correct balance for *new* issuance is zero rather
+  // than a negative number that would read as insolvency.
+  await store.setHeadroom(balance > 0n ? balance : 0n)
+
+  return balance
 }

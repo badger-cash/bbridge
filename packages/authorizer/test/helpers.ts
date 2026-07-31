@@ -131,6 +131,17 @@ export class FakeStore implements Store {
   async setHeadroom(amount: bigint) {
     this.headroom = amount
   }
+
+  unreleasedBurns = 0n
+  /** Reservations still outstanding, i.e. signed but not yet visible in supply. */
+  outstanding = 0n
+
+  async getUnreleasedBurnQuantity() {
+    return this.unreleasedBurns
+  }
+  async getOutstandingReservations() {
+    return this.outstanding
+  }
 }
 
 export class FakeEth implements EthereumReader {

@@ -6,7 +6,7 @@ Transport-free and storage-free. No HTTP, no database, no key material, no chain
 
 ## Status
 
-Functional and tested: `npm test` compiles and runs 75 passing cases against in-memory fakes. Covers the deposit state machine and every one of its edges, authorization message construction and signing, headroom reservation and reconciliation, burn OP_RETURN parsing, and postage co-signing including each refusal path. Does not include a scheduler, an HTTP layer, or any port implementation — see Ports below.
+Functional and tested: `npm test` compiles and runs 82 passing cases against in-memory fakes. Covers the deposit state machine and every one of its edges, authorization message construction and signing, headroom reservation and reconciliation, burn OP_RETURN parsing, and postage co-signing including each refusal path. Does not include a scheduler, an HTTP layer, or any port implementation — see Ports below.
 
 ## Installation
 
@@ -25,6 +25,8 @@ Four obligations, from `authorizer-spec.md` §2. Each exists because nothing els
 **SLP burn validity.** SLP is an overlay protocol with no consensus validation, so a transaction declaring a billion tokens while spending one confirms on XEC perfectly normally. `BridgeLock.release()` pays out the quantity the OP_RETURN *declares* and has no way to check it. The Authorizer's postage signature is the only thing in the entire system that attests a burn is real, which is why `SlpValidator` must fail closed and why this package refuses rather than assumes on every ambiguous verdict.
 
 **Issuance headroom.** If a deployment enables minting that no Ethereum deposit backs, the bound on it lives only here. `issuance/headroom.ts` treats an atomic compare-and-decrement as the check itself; reading a balance and then deciding is not equivalent and is not safe.
+
+Headroom is `collateral − supply − burned-but-unreleased`. The third term is not a refinement: a withdrawal's burn and its `release()` settle at different moments, `release()` is user-submitted so the burner picks the gap, and `collateral − supply` alone reads that gap as free headroom equal to the burn. Issuing against it before submitting the release proof leaves supply backed by less collateral, with every individual step valid.
 
 **Postage deduplication.** Two concurrent honest stamps for one burn declaration are sufficient for a second full release (`SPEC.md` §IV.6). The claim is therefore taken *before* signing, never after.
 
