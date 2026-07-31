@@ -20,6 +20,10 @@ function baseConfig(overrides: Partial<AuthorizerConfig> = {}): AuthorizerConfig
     headroomReconcileIntervalMs: 60_000,
     pollIntervalMs: 5000,
     feeRateSatsPerKb: 1000,
+    confirmBumpAfterBlocks: 6,
+    confirmBumpPercent: 15,
+    confirmFeeHorizonBlocks: 12,
+    confirmMaxFeeCapWei: 500_000_000_000n,
     ...overrides
   }
 }

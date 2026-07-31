@@ -198,14 +198,14 @@ test('a crash between send and persist does not send a second confirmation', asy
   await h.store.saveDeposit({ ...authorized, state: 'AUTHORIZED', confirmTxHash: undefined })
 
   h.ethWriter.swallowSend = true
-  await assert.rejects(() => advanceAuthorized(h, h.store.deposits.get(DEPOSIT_ID)!))
+  await assert.rejects(() => advanceAuthorized(h, h.store.deposits.get(DEPOSIT_ID)!, h.eth.head))
 
   const nonce = h.store.deposits.get(DEPOSIT_ID)!.confirmNonce
   assert.notEqual(nonce, undefined, 'the nonce was persisted before the send')
-  const sendsAfterCrash = h.ethWriter.sent.length
+  const sendsAfterCrash = h.ethWriter.sends
 
   h.ethWriter.swallowSend = false
-  await advanceAuthorized(h, h.store.deposits.get(DEPOSIT_ID)!)
+  await advanceAuthorized(h, h.store.deposits.get(DEPOSIT_ID)!, h.eth.head)
 
   assert.equal(h.store.deposits.get(DEPOSIT_ID)!.confirmNonce, nonce, 'recovery reuses the same nonce')
   assert.equal(
@@ -213,7 +213,143 @@ test('a crash between send and persist does not send a second confirmation', asy
     1,
     'every send used one nonce; no second confirmation raced the first'
   )
-  assert.ok(h.ethWriter.sent.length > sendsAfterCrash)
+  assert.ok(h.ethWriter.sends > sendsAfterCrash)
+})
+
+/** Drives a deposit to CONFIRM_SENT and leaves the confirmation unmined. */
+async function atConfirmSent(h: Harness): Promise<void> {
+  h.eth.logs.push(lockedEvent(100))
+  h.eth.deposits.set(DEPOSIT_ID, {
+    depositor: '0x' + '44'.repeat(20),
+    netAmount: 5_000_000n,
+    xecRecipient: 'aa'.repeat(20),
+    status: 'pending'
+  })
+  h.eth.head = 100
+  await tick(h)
+  h.eth.head = 120
+  await settle(h)
+
+  assert.equal(h.store.deposits.get(DEPOSIT_ID)!.state, 'CONFIRM_SENT')
+}
+
+test('a confirmation records what it was sent at, before it is sent', async () => {
+  // The bump policy prices its next attempt against these. Recorded after the send,
+  // a crash in between would leave them lower than what actually reached the
+  // mempool, and a replacement that does not exceed the pending transaction is
+  // refused rather than sent.
+  const h = harness()
+  await atConfirmSent(h)
+
+  const record = h.store.deposits.get(DEPOSIT_ID)!
+  assert.equal(record.confirmSentAtBlock, 120)
+  assert.equal(record.confirmAttempts, 1)
+  assert.equal(record.confirmMaxFeePerGas, h.ethWriter.sent[0].maxFeePerGas)
+  assert.equal(record.confirmMaxPriorityFeePerGas, h.ethWriter.sent[0].maxPriorityFeePerGas)
+})
+
+test('a pending confirmation is left alone until it has waited long enough', async () => {
+  const h = harness()
+  await atConfirmSent(h)
+  const sends = h.ethWriter.sends
+
+  h.eth.head = 125                                  // 5 blocks, below the threshold of 6
+  await settle(h)
+
+  assert.equal(h.ethWriter.sends, sends)
+  assert.equal(h.store.deposits.get(DEPOSIT_ID)!.state, 'CONFIRM_SENT')
+})
+
+test('a stalled confirmation is replaced at the same nonce, never re-signed', async () => {
+  // The property that makes this safe: the signature covers the authorization
+  // message, not the Ethereum transaction carrying it, so gas may change and (v,r,s)
+  // may not. A second nonce would be a second confirmation racing the first.
+  const h = harness()
+  await atConfirmSent(h)
+
+  const before = h.store.deposits.get(DEPOSIT_ID)!
+  const signature = { ...before.signature! }
+
+  h.eth.head = 130
+  await tick(h)
+
+  const after = h.store.deposits.get(DEPOSIT_ID)!
+  assert.equal(h.ethWriter.replacements, 1)
+  assert.equal(new Set(h.ethWriter.sent.map(s => s.nonce)).size, 1)
+  assert.equal(after.confirmNonce, before.confirmNonce)
+  assert.deepEqual(after.signature, signature)
+  assert.equal(after.state, 'CONFIRM_SENT', 'a bump is not a transition')
+})
+
+test('each replacement outbids the one it replaces on both fields', async () => {
+  // A replacement that beats only maxFeePerGas is refused by the txpool on the
+  // priority fee, so a bump that moves one field is a wasted send.
+  const h = harness()
+  await atConfirmSent(h)
+
+  const seen: Array<{ maxFeePerGas: bigint; maxPriorityFeePerGas: bigint }> = [
+    { ...h.ethWriter.sent[0] }
+  ]
+
+  for (const head of [130, 140, 150]) {
+    h.eth.head = head
+    await tick(h)
+    seen.push({ ...h.ethWriter.sent[0] })
+  }
+
+  assert.equal(h.ethWriter.replacements, 3)
+  for (let i = 1; i < seen.length; i++) {
+    assert.ok(seen[i].maxFeePerGas > seen[i - 1].maxFeePerGas, `maxFeePerGas rose at ${i}`)
+    assert.ok(
+      seen[i].maxPriorityFeePerGas > seen[i - 1].maxPriorityFeePerGas,
+      `maxPriorityFeePerGas rose at ${i}`
+    )
+  }
+})
+
+test('the bump clock restarts at each replacement', async () => {
+  // Otherwise every subsequent tick would look overdue and bump again immediately,
+  // outbidding a transaction that has had no chance to be mined.
+  const h = harness()
+  await atConfirmSent(h)
+
+  h.eth.head = 130
+  await tick(h)
+  assert.equal(h.store.deposits.get(DEPOSIT_ID)!.confirmSentAtBlock, 130)
+
+  h.eth.head = 133
+  await tick(h)
+  assert.equal(h.ethWriter.replacements, 1, 'three blocks on is not overdue again')
+})
+
+test('a confirmation stalled above the gas ceiling halts instead of bidding on', async () => {
+  // The one outcome worth waking someone for. Waiting silently at the cap would be
+  // indistinguishable from a confirmation that is merely slow.
+  const h = harness()
+  await atConfirmSent(h)
+
+  // Lowered only now. Applied from the start it would refuse the original send too,
+  // which is correct behaviour but a different test.
+  h.config.confirmMaxFeeCapWei = 1n
+
+  h.eth.head = 130
+  await tick(h)
+
+  assert.equal(h.store.deposits.get(DEPOSIT_ID)!.state, 'HALTED')
+  assert.equal(h.ethWriter.replacements, 0)
+})
+
+test('a confirmation that mines while stalled is never replaced', async () => {
+  const h = harness()
+  await atConfirmSent(h)
+
+  h.ethWriter.mine(0, 121)
+  h.eth.deposits.get(DEPOSIT_ID)!.status = 'confirmed'
+  h.eth.head = 200
+  await settle(h)
+
+  assert.equal(h.ethWriter.replacements, 0)
+  assert.equal(h.store.deposits.get(DEPOSIT_ID)!.state, 'FUNDING_BROADCAST')
 })
 
 test('the confirmation must reach finality depth before funding is broadcast', async () => {

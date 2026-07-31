@@ -63,6 +63,51 @@ export interface AuthorizerConfig {
   /** Ethereum log scanning cadence, milliseconds. */
   pollIntervalMs: number
 
+  /*
+   * Stalled-confirmation fee bumping (authorizer-spec.md §9.1).
+   *
+   * A confirmDeposit() that never mines holds a reserve coin and burns refundDelay
+   * against the depositor, so the service replaces it at the same nonce rather than
+   * waiting. These govern only when and by how much; the signature is reused verbatim.
+   */
+
+  /**
+   * Blocks a confirmation may sit unmined before it is replaced.
+   *
+   * Long enough that ordinary inclusion variance does not trigger a replacement, and
+   * short enough not to eat refundDelay. It also spaces attempts across blocks, which
+   * matters on its own: replacements sent in quick succession can be refused as
+   * underpriced even when the arithmetic margin is met.
+   */
+  confirmBumpAfterBlocks: number
+
+  /**
+   * How much a replacement must exceed the previous transaction by, percent.
+   *
+   * Must clear the node's own price-bump requirement -- 10% on go-ethereum by default,
+   * on BOTH maxFeePerGas and maxPriorityFeePerGas -- with margin for nodes configured
+   * stricter.
+   */
+  confirmBumpPercent: number
+
+  /**
+   * Blocks of worst-case base-fee growth a confirmation is priced to survive.
+   *
+   * The base fee moves by at most an eighth per block, so this is an exponent rather
+   * than a guess: the transaction stays includable for this many consecutive maximal
+   * increases.
+   */
+  confirmFeeHorizonBlocks: number
+
+  /**
+   * Ceiling on maxFeePerGas, wei. No default, deliberately.
+   *
+   * What a deployment will pay to deliver a confirmation is a treasury decision, and a
+   * default here is the kind that gets discovered during a gas spike. Above it the
+   * pipeline halts the deposit for a human rather than bidding without bound.
+   */
+  confirmMaxFeeCapWei: bigint
+
   /**
    * Fee rate used to size a withdrawal postage stamp, sats per kilobyte.
    *
@@ -104,6 +149,33 @@ export function validateConfig(config: AuthorizerConfig): void {
   // floor has to say so with a 1, and accept stamping dust.
   if (config.minBurnAmount < 1n)
     throw new ConfigError('minBurnAmount must be at least 1 base unit')
+
+  // Below the node's own price-bump requirement a replacement is refused outright, so
+  // every bump would be a wasted send and the confirmation would stall exactly as it
+  // does with no policy at all. go-ethereum's default is 10%; this must beat it.
+  if (config.confirmBumpPercent <= 10)
+    throw new ConfigError(
+      `confirmBumpPercent (${config.confirmBumpPercent}) must exceed 10; a replacement ` +
+      'below the node price-bump margin is rejected rather than sent'
+    )
+
+  if (config.confirmBumpAfterBlocks < 1)
+    throw new ConfigError(
+      'confirmBumpAfterBlocks must be at least 1; replacing within the same block the ' +
+      'original was sent in invites an underpriced refusal'
+    )
+
+  // Zero would price a confirmation at exactly the current base fee, which the very
+  // next block can exceed. The point of the horizon is to survive growth, so it has to
+  // cover at least one block of it.
+  if (config.confirmFeeHorizonBlocks < 1)
+    throw new ConfigError('confirmFeeHorizonBlocks must be at least 1')
+
+  if (config.confirmMaxFeeCapWei <= 0n)
+    throw new ConfigError(
+      'confirmMaxFeeCapWei must be positive; it is the price above which a confirmation ' +
+      'halts for a human rather than bidding without bound'
+    )
 
   // Not an error, but worth saying out loud: unequal decimals put every deposit and
   // release through SPEC.md Section III.1's scaling path, where sub-base-unit

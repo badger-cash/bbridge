@@ -1,6 +1,6 @@
 {
   "name": "@bbridge/authorizer",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Reference implementation of the bbridge Authorizer service core: deposit confirmation with vault UTXO quarantine, and withdrawal postage co-signing",
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",

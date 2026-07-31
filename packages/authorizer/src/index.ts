@@ -13,6 +13,14 @@ export type { AuthorizerConfig } from './config'
 
 export { deriveVaultAddress, vaultOutputValue } from './deposit/vault'
 export {
+  confirmGasPolicy,
+  initialConfirmGas,
+  bumpBy,
+  worstCaseBaseFee,
+  GasCeilingError
+} from './deposit/gasPolicy'
+export type { BumpDecision, GasPolicyInput } from './deposit/gasPolicy'
+export {
   hash256,
   toXecAmount,
   txidToInternal,

@@ -27,6 +27,7 @@ import type {
 import { assertTransition, refundForeclosed } from '../states'
 import type { DepositState } from '../states'
 import { buildAuthorization, signAuthorization, txidToInternal } from './authorization'
+import { confirmGasPolicy, GasCeilingError, initialConfirmGas } from './gasPolicy'
 import { deriveVaultAddress, vaultOutputValue } from './vault'
 
 export interface DepositPipelineDeps {
@@ -217,12 +218,34 @@ export async function advanceFundingPrepared(deps: DepositPipelineDeps, record: 
  * between sending and recording the hash is recoverable: the restart resolves what
  * that nonce did rather than resubmitting blind (§4.3).
  */
-export async function advanceAuthorized(deps: DepositPipelineDeps, record: DepositRecord): Promise<void> {
-  const { ethWriter, store } = deps
+export async function advanceAuthorized(
+  deps: DepositPipelineDeps,
+  record: DepositRecord,
+  head: number
+): Promise<void> {
+  const { eth, ethWriter, store, config } = deps
 
   const nonce = record.confirmNonce ?? (await ethWriter.reserveNonce())
-  if (record.confirmNonce === undefined)
-    await store.saveDeposit({ ...record, confirmNonce: nonce })
+
+  const feeData = await eth.getFeeData()
+  const gas = initialConfirmGas({
+    baseFeePerGas: feeData.baseFeePerGas,
+    suggestedPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+    config
+  })
+
+  // Before the send, all of it. The nonce for the reason §4.3 gives; the fees and the
+  // height because the bump policy prices its next attempt against them, and figures
+  // recorded after a send can be lower than what went out.
+  const pending: DepositRecord = {
+    ...record,
+    confirmNonce: nonce,
+    confirmSentAtBlock: head,
+    confirmMaxFeePerGas: gas.maxFeePerGas,
+    confirmMaxPriorityFeePerGas: gas.maxPriorityFeePerGas,
+    confirmAttempts: (record.confirmAttempts ?? 0) + 1
+  }
+  await store.saveDeposit(pending)
 
   const txHash = await ethWriter.sendConfirmDeposit({
     nonce,
@@ -231,10 +254,113 @@ export async function advanceAuthorized(deps: DepositPipelineDeps, record: Depos
     utxoIndex: record.vaultOutputIndex!,
     v: record.signature!.v,
     r: record.signature!.r,
-    s: record.signature!.s
+    s: record.signature!.s,
+    maxFeePerGas: gas.maxFeePerGas,
+    maxPriorityFeePerGas: gas.maxPriorityFeePerGas
   })
 
-  await transition(deps, { ...record, confirmNonce: nonce }, 'CONFIRM_SENT', { confirmTxHash: txHash })
+  await transition(deps, pending, 'CONFIRM_SENT', { confirmTxHash: txHash })
+}
+
+/**
+ * Replaces a confirmation that has sat unmined too long (authorizer-spec.md §9.1).
+ *
+ * Same nonce, same signature, higher price. No state transition: the deposit is still
+ * in CONFIRM_SENT and still waiting on the same authorization -- only what it is
+ * willing to pay has changed.
+ *
+ * Waiting is not the neutral option this replaces. A pending confirmation holds a
+ * reserve coin the whole pool shares with every other deposit, and refundDelay is
+ * running down against a depositor who may be reclaiming. Losing the race means the
+ * deposit refunds instead of bridging, having been abandoned by inaction.
+ */
+async function maybeBumpConfirmation(
+  deps: DepositPipelineDeps,
+  record: DepositRecord,
+  head: number
+): Promise<void> {
+  const { eth, ethWriter, store, config, logger } = deps
+
+  // Written before the first send, so its absence means a record predating fee
+  // bumping. Priced on the next send rather than guessed at from lockedAtBlock.
+  if (
+    record.confirmSentAtBlock === undefined ||
+    record.confirmMaxFeePerGas === undefined ||
+    record.confirmMaxPriorityFeePerGas === undefined
+  )
+    return
+
+  const feeData = await eth.getFeeData()
+
+  let gas
+  try {
+    gas = confirmGasPolicy({
+      blocksSinceSent: head - record.confirmSentAtBlock,
+      baseFeePerGas: feeData.baseFeePerGas,
+      suggestedPriorityFeePerGas: feeData.maxPriorityFeePerGas,
+      previous: {
+        maxFeePerGas: record.confirmMaxFeePerGas,
+        maxPriorityFeePerGas: record.confirmMaxPriorityFeePerGas
+      },
+      config
+    })
+  } catch (error) {
+    if (!(error instanceof GasCeilingError))
+      throw error
+
+    // Not a stall this pipeline can price its way out of. Halting says so, where
+    // continuing to wait silently would look identical to a confirmation that is
+    // merely slow.
+    await transition(deps, record, 'HALTED')
+    logger.error('confirmation stalled above the gas ceiling', {
+      depositId: record.depositId,
+      required: error.requiredMaxFeePerGas.toString(),
+      cap: error.capWei.toString(),
+      attempts: record.confirmAttempts ?? 1
+    })
+    return
+  }
+
+  if (!gas)
+    return
+
+  const attempts = (record.confirmAttempts ?? 1) + 1
+
+  await store.saveDeposit({
+    ...record,
+    confirmSentAtBlock: head,
+    confirmMaxFeePerGas: gas.maxFeePerGas,
+    confirmMaxPriorityFeePerGas: gas.maxPriorityFeePerGas,
+    confirmAttempts: attempts
+  })
+
+  const txHash = await ethWriter.sendConfirmDeposit({
+    nonce: record.confirmNonce!,
+    depositId: record.depositId,
+    utxoTxid: '0x' + txidToInternal(record.fundingTxid!).toString('hex'),
+    utxoIndex: record.vaultOutputIndex!,
+    v: record.signature!.v,
+    r: record.signature!.r,
+    s: record.signature!.s,
+    maxFeePerGas: gas.maxFeePerGas,
+    maxPriorityFeePerGas: gas.maxPriorityFeePerGas
+  })
+
+  await store.saveDeposit({
+    ...record,
+    confirmSentAtBlock: head,
+    confirmMaxFeePerGas: gas.maxFeePerGas,
+    confirmMaxPriorityFeePerGas: gas.maxPriorityFeePerGas,
+    confirmAttempts: attempts,
+    confirmTxHash: txHash
+  })
+
+  logger.info('confirmation replaced at a higher fee', {
+    depositId: record.depositId,
+    nonce: record.confirmNonce,
+    attempts,
+    maxFeePerGas: gas.maxFeePerGas.toString()
+  })
 }
 
 /**
@@ -268,8 +394,12 @@ export async function advanceConfirmSent(
     return
   }
 
-  if (sent.blockNumber === null)
-    return // still pending; confirmGasPolicy decides when to bump (§8.1)
+  if (sent.blockNumber === null) {
+    // Still pending. Whether that has gone on long enough to be worth paying more for
+    // is confirmGasPolicy's call (§9.1).
+    await maybeBumpConfirmation(deps, record, head)
+    return
+  }
 
   if (onChain.status !== 'confirmed') {
     // Mined, but the deposit is not confirmed and not refunded -- the call reverted
@@ -383,7 +513,7 @@ export async function tick(deps: DepositPipelineDeps): Promise<void> {
     await advanceFundingPrepared(deps, record)
 
   for (const record of await deps.store.findDepositsByState(['AUTHORIZED']))
-    await advanceAuthorized(deps, record)
+    await advanceAuthorized(deps, record, head)
 
   for (const record of await deps.store.findDepositsByState(['CONFIRM_SENT']))
     await advanceConfirmSent(deps, record, head)
