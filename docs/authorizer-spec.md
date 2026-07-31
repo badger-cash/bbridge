@@ -307,22 +307,32 @@ An application built on the wrapped token may legitimately want this — convert
 ```
 headroom = collateral currently held by the Lock Contract, converted to XEC-side units
          − circulating wrapped supply
+         − quantity burned on XEC whose collateral has not yet been released
 ```
 
-Both operands are public — the first from the Lock Contract, the second from an SLP indexer — so any party can recompute this and check the service's behaviour without cooperation. That is the same auditability the deposit path gets from Section III.5's publication, measured against XEC instead of Ethereum.
+All three operands are public — the first from the Lock Contract, the second from an SLP indexer, the third from the burns visible on XEC against `burnUtxoConsumedBy` and the `WithdrawalReleased` log — so any party can recompute this and check the service's behaviour without cooperation. That is the same auditability the deposit path gets from Section III.5's publication, measured against XEC instead of Ethereum.
 
 **It must be current collateral, not cumulative deposits.** A cumulative "total confirmed, unrefunded deposits" figure never decreases, while a user's withdrawal burn *does* reduce supply — so the difference would grow by the withdrawn amount on every ordinary withdrawal, manufacturing phantom headroom out of other people's exits. Measure against what the contract actually holds.
 
-Checking the definition against the three operations that move it:
+**The third term is not a refinement; without it the rule is exploitable.** A withdrawal's two legs do not settle together: the burn destroys tokens on XEC at one moment, and `release()` removes the matching collateral at another. `release()` is permissionless and user-submitted (`overview.md` §6 step 3) precisely so no further cooperation is needed once a burn confirms — which also means **the burner chooses how long the two legs stay apart.**
 
-| Operation | Collateral | Supply | Headroom |
-|---|---|---|---|
-| Deposit confirmed and minted | `+X` | `+X` | unchanged |
-| User withdrawal (burn + release) | `−X` | `−X` | unchanged |
-| Raw burn ([§6.2](#62-creating-headroom)) | unchanged | `−Z` | `+Z` |
-| Discretionary issuance | unchanged | `+Y` | `−Y` |
+Measured as `collateral − supply` alone, that interval reads as free headroom equal to the burn. A holder can therefore burn `X` of legitimately-backed tokens, wait for confirmation, issue `X` discretionarily against the apparent headroom, and only then submit their own release proof. Each step is individually valid and no check is bypassed; the bridge ends up with supply unchanged and collateral lower by `X`. Subtracting burns that have not yet been released cancels the interval exactly.
 
-In a bridge doing nothing but its own business, the two terms track exactly and headroom sits at zero — which is the correct default. Headroom exists only where someone deliberately put it.
+A burn that is never released holds its term open indefinitely. That is correct rather than a leak — its collateral has not moved either.
+
+Checking the definition against the operations that move it:
+
+| Operation | Collateral | Supply | Unreleased | Headroom |
+|---|---|---|---|---|
+| Deposit confirmed and minted | `+X` | `+X` | — | unchanged |
+| Withdrawal burn confirmed | — | `−X` | `+X` | unchanged |
+| `release()` for that burn | `−X` | — | `−X` | unchanged |
+| Raw burn ([§6.2](#62-creating-headroom)) | unchanged | `−Z` | — | `+Z` |
+| Discretionary issuance | unchanged | `+Y` | — | `−Y` |
+
+The raw burn and the withdrawal burn differ in exactly the way that matters: a raw burn carries no bridge `BURN` OP_RETURN, so `release()` cannot parse it and no collateral will ever leave against it ([§6.2](#62-creating-headroom)). It therefore never enters the third term, and the headroom it creates is real and permanent.
+
+In a bridge doing nothing but its own business, the terms track exactly and headroom sits at zero — which is the correct default. Headroom exists only where someone deliberately put it.
 
 Note the decimal conversion in the first operand: collateral is denominated in the Ethereum token's decimals and supply in the wrapped token's, so the comparison must apply Section III.1's scaling. Where the two differ, round the collateral side **down**, so rounding can only understate headroom.
 
@@ -343,6 +353,10 @@ A *raw burn* is not a bridge withdrawal burn. It is an ordinary transaction that
 **Headroom must be reserved durably at signing time, not recomputed per request.** Two concurrent issuances that both read the same indexer balance will both pass a fresh check and together exceed the limit. The indexer also lags the chain, which widens that window well past what request timing alone would suggest. Treat headroom exactly like the reserve-coin exclusivity in [§4.1](#41-reserve-pool-and-vault-funding): an atomic decrement against a durable balance, released only if the issuance demonstrably failed.
 
 **Reconcile periodically against both chains.** The durable balance is a local projection and will drift — failed broadcasts, reorgs, issuances that never confirmed. Recompute from the Lock Contract and the indexer on a schedule and correct.
+
+**Reconciliation must subtract reservations it cannot yet see.** An issuance that has been signed but whose mint has not confirmed is absent from the indexer's supply figure, so a reconcile writing the raw bound overwrites that reservation and hands the same capacity out a second time — undoing the obligation above rather than correcting drift. The window is the one this section already names: the indexer lags the chain, and a scheduled reconcile sits inside that lag exactly as a per-request recomputation would. Write `bound − outstanding reservations`, where a reservation stays outstanding until the vault UTXO its authorization names is observed spent. Counting one for too long understates headroom, which is the safe direction; dropping one early is the failure this prevents.
+
+**Judge solvency on the bound, and clamp only the balance.** A bound fully committed to pending issuance describes a full bridge, not an insolvent one, so the halt condition below applies to the bound rather than to what remains after reservations. Where reservations exceed the bound, the balance available for *new* issuance is zero — those signatures exist and cannot be recalled — but that is a clamp on what may be issued next, not a reason to stop.
 
 **A negative reconciled headroom is a halt condition, not a warning.** It means supply already exceeds collateral, so some holder's tokens are unbacked. Continuing to issue compounds it. Stop signing discretionary issuance, alert, and reconcile by hand.
 

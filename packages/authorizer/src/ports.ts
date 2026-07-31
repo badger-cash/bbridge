@@ -437,6 +437,45 @@ export interface Store {
    * Contract and the indexer.
    */
   setHeadroom(amount: bigint): Promise<void>
+
+  /**
+   * Total quantity burned on XEC whose collateral has not yet left Ethereum, in
+   * XEC-side base units.
+   *
+   * Subtracted from headroom, and it closes a real hole rather than refining a figure.
+   * A withdrawal destroys tokens at one moment and `release()` removes the matching
+   * collateral at another, and `release()` is permissionless and user-submitted -- so
+   * the burner decides how far apart those moments are. In between, `collateral -
+   * supply` reads high by the burn amount, and issuing against that inflated figure
+   * before submitting the release proof leaves supply backed by less collateral than
+   * before. Every individual step is valid, so nothing else catches it.
+   *
+   * The service can answer this: postage is a hard gate (§5), so it stamps every burn
+   * that can ever be released and already records them for deduplication. The released
+   * side is observable two ways -- `BridgeLock` emits `WithdrawalReleased`, indexed on
+   * the burn txid this service itself broadcast, and `burnUtxoConsumedBy` is a public
+   * mapping keyed on the burn's input 0 outpoint, so the state can be read directly
+   * without depending on log retention.
+   *
+   * A burn that is never released holds its quantity here indefinitely. That is
+   * correct, not a leak: its collateral has not moved either.
+   */
+  getUnreleasedBurnQuantity(): Promise<bigint>
+
+  /**
+   * Total reserved for issuances that are signed but not yet observable in supply.
+   *
+   * Subtracted at reconcile time. Without it, a reconcile landing between signing and
+   * confirmation writes a balance computed from a supply figure that does not include
+   * the pending mint, overwriting the reservation and handing the same capacity out
+   * twice -- undoing what reserveHeadroom's atomicity exists to guarantee.
+   *
+   * "Not yet observable in supply" is the sound reading of outstanding: a reservation
+   * stays counted until the vault UTXO its authorization names is seen spent. Counting
+   * one for too long understates available headroom, which is the safe direction;
+   * dropping one too early is the failure this exists to prevent.
+   */
+  getOutstandingReservations(): Promise<bigint>
 }
 
 /* --------------------------------------------------------------- StampSource */
