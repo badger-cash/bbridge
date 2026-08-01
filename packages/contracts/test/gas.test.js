@@ -26,11 +26,11 @@ const { bitsToTarget, mineSingleTxHeader, EASY_BITS } = require('./helpers/ecash
  */
 
 /**
- * Observed 343,512 worst case, down from 448,039 once readPush stopped copying a byte
- * at a time. Tightened to match: a ceiling left at the old 500,000 would sit 45% above
- * the real figure and quietly absorb the whole regression it exists to catch.
+ * Observed 275,230 worst case, down from 448,039 once the byte-at-a-time readers were
+ * replaced with word reads. Tightened each time rather than left where it was: a
+ * ceiling far above the real figure quietly absorbs the regression it exists to catch.
  */
-const RELEASE_CEILING = 390_000
+const RELEASE_CEILING = 310_000
 
 /** Observed 186,004. Paid by the Authorizer's gas key, once per deposit. */
 const CONFIRM_DEPOSIT_CEILING = 220_000

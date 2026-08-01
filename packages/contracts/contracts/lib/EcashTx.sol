@@ -101,9 +101,16 @@ library EcashTx {
 
     /// @dev Straight byte-order copy (no reversal) -- matches how a 32-byte field is
     /// laid out in the source bytes.
+    ///
+    /// A single calldataload, because the EVM word is already big-endian and this
+    /// field is already 32 bytes: the byte-at-a-time loop this replaces was
+    /// reassembling, one shift at a time, exactly the word the machine would have
+    /// handed over whole. The bounds check the loop performed per index is explicit
+    /// now, since calldataload past the end yields zeros rather than reverting.
     function readBytes32(bytes calldata data, uint256 offset) internal pure returns (bytes32 result) {
-        for (uint256 i = 0; i < 32; i++) {
-            result |= bytes32(uint256(uint8(data[offset + i]))) << (8 * (31 - i));
+        require(offset + 32 <= data.length, "EcashTx: read runs past end of data");
+        assembly ("memory-safe") {
+            result := calldataload(add(data.offset, offset))
         }
     }
 
@@ -224,8 +231,24 @@ library EcashTx {
     }
 
     function readBigEndianUint(bytes memory data, uint256 offset, uint256 len) internal pure returns (uint256 value) {
-        for (uint256 i = 0; i < len; i++) {
-            value = (value << 8) | uint8(data[offset + i]);
+        require(offset + len <= data.length, "EcashTx: read runs past end of data");
+        if (len == 0) return 0;
+
+        if (len >= 32) {
+            // The loop this replaces shifted left once per byte, so with len > 32
+            // everything before the final 32 bytes was pushed out of the uint256 and
+            // discarded. That is not incidental -- DER encodes r and s as 33 bytes
+            // whenever the leading bit would otherwise read as a sign, and the
+            // discarded byte is exactly that 0x00 pad. Reading the last 32 bytes
+            // produces the identical value; anything else would reject valid
+            // signatures.
+            assembly ("memory-safe") {
+                value := mload(add(add(data, 0x20), add(offset, sub(len, 32))))
+            }
+        } else {
+            assembly ("memory-safe") {
+                value := shr(mul(8, sub(32, len)), mload(add(add(data, 0x20), offset)))
+            }
         }
     }
 
@@ -240,8 +263,11 @@ library EcashTx {
         uint8 prefix = uint8(compressed[0]);
         require(prefix == 0x02 || prefix == 0x03, "EcashTx: bad compressed pubkey prefix");
 
-        for (uint256 i = 0; i < 32; i++) {
-            x = (x << 8) | uint8(compressed[1 + i]);
+        // Bytes 1..32 are a big-endian 32-byte integer, which is what an EVM word
+        // already is -- so one mload, at the data start plus the prefix byte. The
+        // length is required to be exactly 33 above, so this cannot overrun.
+        assembly ("memory-safe") {
+            x := mload(add(compressed, 0x21))
         }
 
         uint256 rhs = addmod(mulmod(mulmod(x, x, P), x, P), B, P);
