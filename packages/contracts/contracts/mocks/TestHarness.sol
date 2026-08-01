@@ -3,10 +3,19 @@ pragma solidity ^0.8.24;
 
 import {MerkleProof} from "../lib/MerkleProof.sol";
 import {Difficulty} from "../lib/Difficulty.sol";
+import {EcashTx} from "../lib/EcashTx.sol";
 
 /// @notice Test-only wrapper exposing internal library functions externally so they
 /// can be called directly from tests, without going through BridgeLock's own state.
 contract TestHarness {
+    function readPush(bytes calldata script, uint256 offset) external pure returns (bytes memory data, uint256 newOffset) {
+        return EcashTx.readPush(script, offset);
+    }
+
+    function extractSigAndPubkey(bytes calldata scriptSig) external pure returns (bytes memory sig, bytes memory pubkey) {
+        return EcashTx.extractSigAndPubkey(scriptSig);
+    }
+
     function merkleVerify(bytes32 leaf, bytes32[] calldata branch, uint256 index, bytes32 root) external pure returns (bool) {
         return MerkleProof.verify(leaf, branch, index, root);
     }

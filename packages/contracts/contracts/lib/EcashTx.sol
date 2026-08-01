@@ -154,10 +154,35 @@ library EcashTx {
             revert("EcashTx: unsupported push opcode");
         }
 
+        // The byte-at-a-time copy this replaces carried an implicit bounds check on
+        // every index -- a script claiming a 72-byte push while holding 40 bytes
+        // panicked rather than reading on. The word-wise copy below has no such check,
+        // so it is made explicit here. Without it a truncated scriptSig would read
+        // whatever memory happens to follow and hand back a well-formed-looking
+        // signature, which is the difference between a rejected burn and an accepted
+        // forgery.
+        require(dataStart + len <= script.length, "EcashTx: push runs past end of script");
+
         data = new bytes(len);
-        for (uint256 i = 0; i < len; i++) {
-            data[i] = script[dataStart + i];
+
+        // Word-wise rather than byte-wise: the old loop cost about 310 gas per byte,
+        // and a signature plus a pubkey is ~106 of them on every one of release()'s two
+        // inputs. Copying 32 at a time is the single largest saving available in this
+        // library (see test/gasProfile.test.js).
+        //
+        // memory-safe: `new bytes(len)` allocates a 32-byte-aligned region, so writing
+        // whole words up to the rounded-up length stays inside this allocation. The
+        // final read may take up to 31 bytes from past the end of `script`, which lands
+        // only in `data`'s own padding -- bytes beyond `len` that no reader of a
+        // `bytes` value ever observes.
+        assembly ("memory-safe") {
+            let src := add(add(script, 0x20), dataStart)
+            let dst := add(data, 0x20)
+            for { let i := 0 } lt(i, len) { i := add(i, 0x20) } {
+                mstore(add(dst, i), mload(add(src, i)))
+            }
         }
+
         newOffset = dataStart + len;
     }
 

@@ -25,8 +25,12 @@ const { bitsToTarget, mineSingleTxHeader, EASY_BITS } = require('./helpers/ecash
  * withdrawal got more expensive for every user, and that belongs in a commit message.
  */
 
-/** Observed 448,039 at the time of writing. */
-const RELEASE_CEILING = 500_000
+/**
+ * Observed 343,512 worst case, down from 448,039 once readPush stopped copying a byte
+ * at a time. Tightened to match: a ceiling left at the old 500,000 would sit 45% above
+ * the real figure and quietly absorb the whole regression it exists to catch.
+ */
+const RELEASE_CEILING = 390_000
 
 /** Observed 186,004. Paid by the Authorizer's gas key, once per deposit. */
 const CONFIRM_DEPOSIT_CEILING = 220_000
