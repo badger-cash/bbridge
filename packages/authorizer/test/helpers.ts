@@ -53,6 +53,10 @@ export function testConfig(overrides: Partial<AuthorizerConfig> = {}): Authorize
     headroomReconcileIntervalMs: 60_000,
     pollIntervalMs: 1000,
     feeRateSatsPerKb: 1000,
+    confirmBumpAfterBlocks: 6,
+    confirmBumpPercent: 15,
+    confirmFeeHorizonBlocks: 12,
+    confirmMaxFeeCapWei: 500_000_000_000n,
     ...overrides
   }
 }
@@ -173,23 +177,64 @@ export class FakeEth implements EthereumReader {
   async getLockedCollateral() {
     return this.collateral
   }
+  /** Fee conditions at the head. Wei, and deliberately round so bumps are readable. */
+  baseFeePerGas = 10_000_000_000n
+  priorityFeePerGas = 1_000_000_000n
+  async getFeeData() {
+    return { baseFeePerGas: this.baseFeePerGas, maxPriorityFeePerGas: this.priorityFeePerGas }
+  }
 }
 
 export class FakeEthWriter implements EthereumWriter {
   nextNonce = 0
-  sent: Array<{ nonce: number; depositId: string; utxoTxid: string; blockNumber: number | null }> = []
+  sent: Array<{
+    nonce: number
+    depositId: string
+    utxoTxid: string
+    blockNumber: number | null
+    maxFeePerGas: bigint
+    maxPriorityFeePerGas: bigint
+  }> = []
   /** Set to drop the send after it has taken effect, simulating a crash mid-window. */
   swallowSend = false
 
   async reserveNonce() {
     return this.nextNonce++
   }
-  async sendConfirmDeposit(args: { nonce: number; depositId: string; utxoTxid: string }) {
-    this.sent.push({ nonce: args.nonce, depositId: args.depositId, utxoTxid: args.utxoTxid, blockNumber: null })
+  async sendConfirmDeposit(args: {
+    nonce: number
+    depositId: string
+    utxoTxid: string
+    maxFeePerGas: bigint
+    maxPriorityFeePerGas: bigint
+  }) {
+    this.sends++
+    // Replaces in place, as the txpool does: one transaction per nonce, at the newest
+    // price. Appending instead would let a test assert a bump that never displaced
+    // anything.
+    const existing = this.sent.find(t => t.nonce === args.nonce)
+    if (existing) {
+      existing.maxFeePerGas = args.maxFeePerGas
+      existing.maxPriorityFeePerGas = args.maxPriorityFeePerGas
+      this.replacements++
+    } else {
+      this.sent.push({
+        nonce: args.nonce,
+        depositId: args.depositId,
+        utxoTxid: args.utxoTxid,
+        blockNumber: null,
+        maxFeePerGas: args.maxFeePerGas,
+        maxPriorityFeePerGas: args.maxPriorityFeePerGas
+      })
+    }
     if (this.swallowSend)
       throw new Error('simulated crash after send, before persist')
     return '0x' + 'ee'.repeat(32)
   }
+  /** Calls made, whether or not they displaced anything. `sent` collapses per nonce. */
+  sends = 0
+  /** How many sends landed on an already-occupied nonce. */
+  replacements = 0
   async getTransactionByNonce(nonce: number) {
     const tx = this.sent.find(t => t.nonce === nonce)
     return tx ? { txHash: '0x' + 'ee'.repeat(32), blockNumber: tx.blockNumber } : null

@@ -393,7 +393,10 @@ XEC-side reorgs affect only `MINTED`, which is monitoring-only and carries no pr
 | `minBurnAmount` | Postage floor, `10^xecDecimals` base units ($1). See [§5.1](#51-minimum-burn-quantity). |
 | `allowDiscretionaryIssuance` | Off by default. Off means headroom is structurally zero and [§6](#6-discretionary-issuance-and-headroom) cannot be violated. |
 | `headroomReconcileInterval` | How often the durable headroom balance is recomputed from both chains ([§6.3](#63-accounting-obligations)). Drift is expected; unbounded drift is not. |
-| `confirmGasPolicy` | Fee-bump policy for a stalled `confirmDeposit()`. See [§9.1](#91-stalled-confirmations). |
+| `confirmBumpAfterBlocks` | Blocks a confirmation may sit unmined before it is replaced. See [§9.1](#91-stalled-confirmations). |
+| `confirmBumpPercent` | How far a replacement must exceed the transaction it replaces. Must clear the node's own price-bump requirement — 10% on go-ethereum by default, on both fee fields. |
+| `confirmFeeHorizonBlocks` | Blocks of worst-case base-fee growth a confirmation is priced to survive. An exponent on 9/8, not a guessed multiple. |
+| `confirmMaxFeeCapWei` | Ceiling on `maxFeePerGas`. No default: what a deployment will pay to deliver a confirmation is a treasury decision. Above it the deposit halts. |
 
 ## 9.1 Stalled Confirmations
 
@@ -406,5 +409,18 @@ The resolution is a **fee bump at the same nonce**, and the important property i
 The service must therefore **replace, never re-sign**. Re-signing is not merely unnecessary, it is a way to get things wrong: a fresh signature over a *different* vault outpoint would strand the first funding transaction, and there is no legitimate reason for the signed content to change between attempts. `confirmGasPolicy` governs only when to bump and by how much.
 
 Two failure modes bound the policy. A bump that is too slow holds a reserve coin and leaves `refundDelay` running down against a depositor who may be trying to reclaim. A replacement broadcast so aggressively that the original also lands is harmless — the second reverts `AlreadyConfirmed` and changes no state — so the policy should err toward bumping early.
+
+**Two floors apply, and the price is the higher of them.** They fail differently, and clearing only one wastes the attempt either way:
+
+- The **replacement floor** is what the node's transaction pool demands before it will accept a second transaction at an occupied nonce — go-ethereum's `--txpool.pricebump`, 10% by default, and it must be cleared on `maxFeePerGas` **and** `maxPriorityFeePerGas` alike. Miss it and the send is refused outright.
+- The **market floor** is what the chain demands to include the transaction at all. Miss it and the send is accepted, then sits exactly as stuck as its predecessor. Because the base fee moves by at most an eighth per block, pricing against it is arithmetic rather than estimation: a confirmation that must survive `n` blocks of worst-case growth needs `baseFee × (9/8)^n`, plus the tip.
+
+Both floors round **up**. A replacement one wei short of the margin is refused, so a truncating division is the difference between a bump and a no-op.
+
+The **same market floor prices the first send**, so the original and its replacements cannot disagree about what the chain wants.
+
+Bumping cannot continue without bound, so `confirmMaxFeeCapWei` ends it. Above the ceiling the deposit reaches `HALTED` and says what price it would have taken. Capping silently instead — continuing to wait at the ceiling — reproduces the stall this section exists to end, at a higher price and with nobody told.
+
+Each attempt persists its intended fees and the height it was sent at **before** sending, for the same reason the nonce is persisted first ([§4.3](#43-durability-at-each-edge)). The replacement margin is defined against the pending transaction's own fees, and those cannot be read back — resolving a nonce yields no transaction hash while it is pending. Recording afterwards would let a crash leave the next attempt pricing against a figure lower than what actually reached the mempool; recording first makes it an upper bound, which is the direction that still works.
 
 `refundDelay` is a contract-side deployment constant (Appendix A), but its correct value depends on this service: Section III.2 requires it to "comfortably exceed the Authorizer service's expected sign-to-mined latency". That latency is `pollInterval` plus signing plus Ethereum inclusion time, and should be measured against a running service before the contract is deployed.

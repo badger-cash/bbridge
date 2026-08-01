@@ -85,6 +85,15 @@ export interface EthereumReader {
    * would grow every time a user exits.
    */
   getLockedCollateral(): Promise<bigint>
+
+  /**
+   * Current fee conditions, wei (authorizer-spec.md §9.1).
+   *
+   * `baseFeePerGas` must come from the chain head rather than from an average: it is
+   * compounded forward to price a confirmation against worst-case growth, and a
+   * backward-looking figure would price against conditions that have already passed.
+   */
+  getFeeData(): Promise<{ baseFeePerGas: bigint; maxPriorityFeePerGas: bigint }>
 }
 
 export interface EthereumWriter {
@@ -105,7 +114,13 @@ export interface EthereumWriter {
    * Re-sending at the same nonce is how a stalled confirmation is fee-bumped. The
    * signature is reused verbatim: it covers the authorization message, never the
    * Ethereum transaction carrying it, so gas and nonce are outside the signed
-   * content. Never re-sign to bump (authorizer-spec.md §8.1).
+   * content. Never re-sign to bump (authorizer-spec.md §9.1).
+   *
+   * The fees are supplied rather than left to the implementation, and must be sent as
+   * given. A replacement has to exceed the pending transaction's fees by the node's
+   * price-bump margin on both fields; an implementation that substituted its own
+   * estimate would decide that margin by accident and the replacement would be
+   * refused.
    */
   sendConfirmDeposit(args: {
     nonce: number
@@ -115,6 +130,8 @@ export interface EthereumWriter {
     v: number
     r: string
     s: string
+    maxFeePerGas: bigint
+    maxPriorityFeePerGas: bigint
   }): Promise<string>
 
   /** Resolves what a reserved nonce did, for crash recovery from CONFIRM_SENT. */
@@ -339,6 +356,38 @@ export interface DepositRecord {
   confirmNonce?: number
   confirmTxHash?: string
   confirmedAtBlock?: number
+
+  /*
+   * Fee-bump bookkeeping for a confirmation that has not mined (authorizer-spec.md §9.1).
+   *
+   * All three are persisted BEFORE each send, for the same reason the nonce is: a
+   * crash between sending and recording would otherwise leave the next attempt pricing
+   * against figures lower than what actually reached the mempool, and a replacement
+   * that does not exceed the pending transaction is refused rather than sent. Writing
+   * the intended values first makes the recorded price an upper bound on the sent one,
+   * which is the direction that still works.
+   */
+
+  /**
+   * Ethereum block height at which the pending confirmation was last sent.
+   *
+   * The bump policy's only clock. `lockedAtBlock` is not a substitute -- it predates
+   * the confirmation-depth wait and the finality wait, so blocks elapsed since it say
+   * nothing about how long this transaction has been pending.
+   */
+  confirmSentAtBlock?: number
+  /**
+   * What the pending confirmation was sent at.
+   *
+   * Required, not merely useful: the replacement margin is defined relative to the
+   * pending transaction's own fees, and they cannot be read back. Resolving a nonce
+   * yields no transaction hash while it is pending, since a hash is not recoverable
+   * from a nonce over the standard JSON-RPC surface.
+   */
+  confirmMaxFeePerGas?: bigint
+  confirmMaxPriorityFeePerGas?: bigint
+  /** Sends so far, the original included. Bounds runaway bumping and is worth logging. */
+  confirmAttempts?: number
 }
 
 /**
