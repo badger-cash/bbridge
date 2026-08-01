@@ -174,19 +174,17 @@ describe('BridgeLock', function () {
 
     for (let i = 0; i < minConfirmations; i++) await ethers.provider.send('evm_mine')
 
+    // The signature is published in the log, not stored: it is only ever consumed by
+    // the eCash covenant, which verifies it against `message` directly and cannot read
+    // Ethereum state, so four storage slots per deposit bought nothing.
     await expect(bridge.confirmDeposit(depositId, utxoTxid, utxoIndex, v, r, s))
       .to.emit(bridge, 'DepositConfirmed')
-      .withArgs(depositId, utxoTxid, utxoIndex)
+      .withArgs(depositId, utxoTxid, utxoIndex, v, r, s)
 
     const auth = await bridge.getAuthorization(depositId)
     expect(auth.confirmed).to.equal(true)
     expect(auth.xecRecipient.toLowerCase()).to.equal(xecRecipient.toLowerCase())
     expect(auth.xecAmount).to.equal(xecAmount)
-    expect(auth.utxoTxid).to.equal(utxoTxid)
-    expect(auth.utxoIndex).to.equal(utxoIndex)
-    expect(auth.v).to.equal(v)
-    expect(auth.r).to.equal(r)
-    expect(auth.s).to.equal(s)
   })
 
   it('rejects confirmation with a signature from a key that is not the Authorizer', async function () {

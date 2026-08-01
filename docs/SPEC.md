@@ -156,7 +156,12 @@ The Authorizer's signature is verified via Ethereum's `ecrecover` against `diges
 
 ## 5. Publication
 
-The contract exposes confirmed authorization content — `{xecRecipient, netAmount, utxoRef, signature}` — via a public, unauthenticated view function, keyed by `depositId`. Any party may query it on equal terms; it is not delivered or negotiated by the Authorizer.
+The contract publishes confirmed authorization content — `{xecRecipient, netAmount, utxoRef, signature}` — on-chain, keyed by `depositId`, over two channels. Any party may read it on equal terms; it is not delivered or negotiated by the Authorizer.
+
+- **`utxoRef` and `signature`** are emitted in the `DepositConfirmed` log.
+- **`xecRecipient` and `netAmount`** come from a public, unauthenticated view function, which derives them from stored deposit state.
+
+The signature is published rather than stored deliberately. It is only ever consumed by the eCash covenant, which verifies it against `message` directly and cannot read Ethereum state at all — so a forged or corrupted authorization fails there, and no Ethereum-side record is consulted before use. Storing it cost four storage slots per deposit for a lookup nothing in the protocol performs. What the requirement actually protects is that retrieval does not depend on the Authorizer, and a log satisfies that as completely as state does.
 
 ## 6. Mint
 

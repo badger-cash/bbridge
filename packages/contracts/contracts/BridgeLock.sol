@@ -67,14 +67,6 @@ contract BridgeLock is ReentrancyGuard {
         bool refunded;
     }
 
-    struct Authorization {
-        bytes32 utxoTxid; // internal byte order, matching EcashTx's convention throughout
-        uint32 utxoIndex;
-        uint8 v;
-        bytes32 r;
-        bytes32 s;
-    }
-
     // -- Deployment parameters (contracts-spec.md `3.`) --------------------------
 
     /// @dev The wrapped ERC-20 held as collateral. Immutable, deployer-chosen. Assumed
@@ -201,7 +193,6 @@ contract BridgeLock is ReentrancyGuard {
     // -- State ---------------------------------------------------------------
 
     mapping(bytes32 depositId => Deposit) public deposits;
-    mapping(bytes32 depositId => Authorization) private _authorizations;
     /// @dev Each eCash vault outpoint (utxoTxid, utxoIndex) names one specific,
     /// once-spendable coin, so it can legitimately back at most one confirmation,
     /// ever (audit finding #1: without this, an old (utxoTxid, utxoIndex, v, r, s)
@@ -271,7 +262,20 @@ contract BridgeLock is ReentrancyGuard {
 
     event DepositLocked(bytes32 indexed depositId, address indexed depositor, uint96 netAmount, bytes20 xecRecipient);
     event DepositRefunded(bytes32 indexed depositId);
-    event DepositConfirmed(bytes32 indexed depositId, bytes32 utxoTxid, uint32 utxoIndex);
+    /// @dev Carries the Authorizer's signature, and is the publication channel
+    /// SPEC.md Section III.5 requires: anyone may read it, on equal terms, without the
+    /// Authorizer delivering or negotiating anything.
+    ///
+    /// A log rather than storage, deliberately. The four slots this used to occupy
+    /// cost about 88,800 gas per deposit, and bought nothing the covenant does not
+    /// already provide: the mint happens on eCash, where the covenant verifies this
+    /// signature against `message` directly and cannot read Ethereum state at all. A
+    /// forged or corrupted authorization fails there, so no Ethereum-side record is
+    /// consulted before use, and none could be. `utxoTxid` and `utxoIndex` are here
+    /// too, being the vault outpoint the signature is bound to.
+    event DepositConfirmed(
+        bytes32 indexed depositId, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s
+    );
     /// @dev The signal an Authorizer monitor is expected to watch for -- see
     /// requestRefund()'s own doc comment.
     event RefundRequested(bytes32 indexed depositId, uint256 requestedAtBlock);
@@ -629,14 +633,19 @@ contract BridgeLock is ReentrancyGuard {
 
         d.confirmed = true;
         utxoConsumedBy[utxoKey] = depositId;
-        _authorizations[depositId] = Authorization({utxoTxid: utxoTxid, utxoIndex: utxoIndex, v: v, r: r, s: s});
 
-        emit DepositConfirmed(depositId, utxoTxid, utxoIndex);
+        emit DepositConfirmed(depositId, utxoTxid, utxoIndex, v, r, s);
     }
 
     /// @notice Public, unauthenticated query -- anyone can retrieve a confirmed
-    /// deposit's authorization content and signature on equal terms; it is not
-    /// delivered or negotiated by the Authorizer (no-action-letter draft `1.2`).
+    /// deposit's authorization content on equal terms; it is not delivered or
+    /// negotiated by the Authorizer (no-action-letter draft `1.2`).
+    ///
+    /// The *signature*, and the vault outpoint it is bound to, come from this
+    /// deposit's `DepositConfirmed` log rather than from here -- see that event. This
+    /// function returns the content that is derivable from stored state, which is
+    /// everything needed to check a log-supplied signature is for the right recipient
+    /// and amount.
     /// @dev `xecAmount` is the XEC-side (xecDecimals, uint64) quantity actually signed
     /// by the Authorizer -- see confirmDeposit(). It is recomputed here from
     /// `netAmount` and `scale` rather than stored, since it's fully determined by
@@ -656,20 +665,10 @@ contract BridgeLock is ReentrancyGuard {
     function getAuthorization(bytes32 depositId)
         external
         view
-        returns (
-            bool confirmed,
-            bytes20 xecRecipient,
-            uint64 xecAmount,
-            bytes32 utxoTxid,
-            uint32 utxoIndex,
-            uint8 v,
-            bytes32 r,
-            bytes32 s
-        )
+        returns (bool confirmed, bytes20 xecRecipient, uint64 xecAmount)
     {
         Deposit storage d = deposits[depositId];
         if (d.depositor == address(0)) revert UnknownDeposit();
-        Authorization storage a = _authorizations[depositId];
         uint256 amount = xecHasMorePrecision ? uint256(d.netAmount) * scale : uint256(d.netAmount) / scale;
         if (amount > type(uint64).max) revert AmountTooLarge();
         // Mirrors confirmDeposit()'s own AmountTooSmall revert -- a deposit whose
@@ -677,7 +676,7 @@ contract BridgeLock is ReentrancyGuard {
         // returns the same revert instead of reporting a value that doesn't
         // correspond to anything confirmDeposit() could ever produce.
         if (amount == 0) revert AmountTooSmall();
-        return (d.confirmed, d.xecRecipient, uint64(amount), a.utxoTxid, a.utxoIndex, a.v, a.r, a.s);
+        return (d.confirmed, d.xecRecipient, uint64(amount));
     }
 
     /// @dev message = depositId (32 bytes)

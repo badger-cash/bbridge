@@ -122,13 +122,21 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
       xecRecipient: storedXecRecipient
     })
 
-    await expect(bridge.confirmDeposit(depositId, utxoTxid, utxoIndex, v, r, s))
-      .to.emit(bridge, 'DepositConfirmed')
-      .withArgs(depositId, utxoTxid, utxoIndex)
+    const confirmReceipt = await (await bridge.confirmDeposit(depositId, utxoTxid, utxoIndex, v, r, s)).wait()
 
     // -- 3. Publication: anyone (this test included) reads the authorization back
-    // from public contract state (overview.md `5.` step 5) -- everything from here
-    // on uses only what this call returns, not the locally-held v/r/s/xecAmount above.
+    // from the chain (overview.md `5.` step 5) -- everything from here on uses only
+    // what publication yields, not the locally-held v/r/s/xecAmount above.
+    //
+    // Two channels, deliberately. The signature and the vault outpoint come from the
+    // DepositConfirmed log, which is where they are published; the recipient and
+    // amount come from the view function, which derives them from stored state. A
+    // reader needs both, and neither requires anything of the Authorizer.
+    const published = confirmReceipt.events.find((e) => e.event === 'DepositConfirmed').args
+    expect(published.depositId).to.equal(depositId)
+    expect(published.utxoTxid).to.equal(utxoTxid)
+    expect(published.utxoIndex).to.equal(utxoIndex)
+
     const auth = await bridge.getAuthorization(depositId)
     expect(auth.confirmed).to.equal(true)
     expect(auth.xecAmount).to.equal(depositAmount.sub(feeAmount).mul(scale)) // exact: XEC is the more precise side
@@ -136,8 +144,8 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
     const tokenIdBuf = Buffer.from(xecTokenId.slice(2), 'hex')
     const xecRecipientBuf = Buffer.from(auth.xecRecipient.slice(2), 'hex')
     const xecAmountNum = auth.xecAmount.toNumber()
-    const authUtxoTxidBuf = Buffer.from(auth.utxoTxid.slice(2), 'hex')
-    const authUtxoIndex = auth.utxoIndex
+    const authUtxoTxidBuf = Buffer.from(published.utxoTxid.slice(2), 'hex')
+    const authUtxoIndex = published.utxoIndex
 
     // -- 4. Mint (overview.md `5.` step 6) ---------------------------------------
     const covenantScript = mintCovenantV2(authorizerEcashRing.getPublicKey())
@@ -173,11 +181,13 @@ describe('bbridge end-to-end lifecycle (deposit -> confirm -> mint -> burn -> re
       xecAmountNum,
       xecRecipientBuf
     )
-    // The exact (v, r, s) getAuthorization() returned -- ecrecover's own serialization
-    // of the Authorizer's ECDSA signature -- re-encoded to DER for the covenant's
-    // OP_CHECKDATASIGVERIFY. Same signature, same curve, different wire format; not a
-    // fresh signature produced for the eCash side.
-    const authSig = secp256k1.signatureExport(Buffer.concat([Buffer.from(auth.r.slice(2), 'hex'), Buffer.from(auth.s.slice(2), 'hex')]))
+    // The exact (v, r, s) the DepositConfirmed log published -- ecrecover's own
+    // serialization of the Authorizer's ECDSA signature -- re-encoded to DER for the
+    // covenant's OP_CHECKDATASIGVERIFY. Same signature, same curve, different wire
+    // format; not a fresh signature produced for the eCash side.
+    const authSig = secp256k1.signatureExport(
+      Buffer.concat([Buffer.from(published.r.slice(2), 'hex'), Buffer.from(published.s.slice(2), 'hex')])
+    )
 
     const mintAccepted = runCovenant(
       mintCovenantV2Ops(authorizerEcashRing.getPublicKey()),

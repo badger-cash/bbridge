@@ -114,7 +114,7 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
 
       await expect(bridge.confirmDeposit(depositId, utxoTxid, utxoIndex, v, r, s))
         .to.emit(bridge, 'DepositConfirmed')
-        .withArgs(depositId, utxoTxid, utxoIndex)
+        .withArgs(depositId, utxoTxid, utxoIndex, v, r, s)
 
       const auth = await bridge.getAuthorization(depositId)
       expect(auth.confirmed).to.equal(true)

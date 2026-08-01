@@ -33,8 +33,13 @@ const { bitsToTarget, mineSingleTxHeader, EASY_BITS } = require('./helpers/ecash
  */
 const RELEASE_CEILING = 280_000
 
-/** Observed 186,004. Paid by the Authorizer's gas key, once per deposit. */
-const CONFIRM_DEPOSIT_CEILING = 220_000
+/**
+ * Observed 74,566, down from 186,004 once the authorization moved from four storage
+ * slots into the DepositConfirmed log. Paid by the Authorizer's gas key, once per
+ * deposit -- the one cost the operator carries rather than the user, so it is worth
+ * a tight ceiling.
+ */
+const CONFIRM_DEPOSIT_CEILING = 90_000
 
 describe('gas ceilings', function () {
   const feeAmount = 1_000n
