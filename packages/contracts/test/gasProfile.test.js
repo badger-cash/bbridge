@@ -84,7 +84,50 @@ describe('release() gas profile', function () {
     console.log(`  ${'stages measured'.padEnd(width)}  ${String(measured).padStart(7)}  ${((measured / total) * 100).toFixed(1).padStart(5)}%`)
     console.log(`  ${'release() total'.padEnd(width)}  ${String(total).padStart(7)}  100.0%`)
     console.log(`  ${'unmeasured'.padEnd(width)}  ${String(total - measured).padStart(7)}  ${(((total - measured) / total) * 100).toFixed(1).padStart(5)}%`)
-    console.log(`\n  (unmeasured = 21,000 tx base + calldata + 2 SSTOREs + ERC20 transfer + dispatch)`)
-    console.log(`  (probe call itself cost ${receipt.gasUsed.toNumber()})\n`)
+    // --- account for what the stage timings cannot reach -------------------------
+    //
+    // Everything above is work inside release(). What is left is the cost of being a
+    // transaction at all, plus storage and the token transfer. Those are computable
+    // or separately measurable, so the remainder does not have to stay a mystery.
+
+    const callData = bridge.interface.encodeFunctionData('release', [
+      '0x' + rawTx.toString('hex'), 546, stampValue, [], 0, '0x' + header.toString('hex')
+    ])
+    const bytes = ethers.utils.arrayify(callData)
+    const zeroBytes = bytes.filter(b => b === 0).length
+    const calldataGas = zeroBytes * 4 + (bytes.length - zeroBytes) * 16
+
+    await probe.profileStorage('0x' + 'cd'.repeat(32))
+    const storage = await probe.results()
+    const named = Object.fromEntries(storage.map(s => [s.name, s.gas.toNumber()]))
+
+    // A transfer into a fresh recipient, which is what a first-time withdrawer gets.
+    await token.mint(depositor.address, 1000)
+    const transferReceipt = await (
+      await token.transfer(ethers.Wallet.createRandom().address, 1)
+    ).wait()
+
+    const sloadCheck = named['SLOAD (cold, consumed-outpoint check)']
+    const sstoreConsumed = named['SSTORE (warm, zero to non-zero)']
+    const storageTotal = (sloadCheck + sstoreConsumed) * 2
+    const transferCost = transferReceipt.gasUsed.toNumber() - 21000 - 68 * 16
+
+    const fixed = [
+      ['transaction base', 21000],
+      ['calldata', calldataGas],
+      ['2x (SLOAD + SSTORE) consumed outpoints', storageTotal],
+      ['ERC20 transfer (mock, fresh recipient)', transferCost]
+    ]
+
+    console.log('  accounted separately:')
+    for (const [name, gas] of fixed)
+      console.log(`  ${name.padEnd(width)}  ${String(gas).padStart(7)}  ${((gas / total) * 100).toFixed(1).padStart(5)}%`)
+
+    const accounted = measured + fixed.reduce((sum, [, g]) => sum + g, 0)
+    console.log(`  ${'-'.repeat(width)}  ${'-'.repeat(7)}  ------`)
+    console.log(`  ${'accounted for'.padEnd(width)}  ${String(accounted).padStart(7)}  ${((accounted / total) * 100).toFixed(1).padStart(5)}%`)
+    console.log(`  ${'still unexplained'.padEnd(width)}  ${String(total - accounted).padStart(7)}  ${(((total - accounted) / total) * 100).toFixed(1).padStart(5)}%`)
+    console.log(`\n  (the remainder is dispatch, memory expansion, and the checks between stages)`)
+    console.log(`  (authorization struct, for confirmDeposit: ${named['SSTORE x4 (authorization struct)']})\n`)
   })
 })

@@ -140,5 +140,61 @@ contract GasProbe {
         g = gasleft();
         MerkleProof.verify(burnTxid, merkleBranch, merkleIndex, root);
         record("MerkleProof.verify", g - gasleft());
+
+        // release()'s own OP_RETURN parse, which is private to BridgeLock and so out
+        // of the probe's reach. Reproduced here rather than skipped: it is eight
+        // readPush calls and their length checks, and leaving it unmeasured was what
+        // hid a third of the first round's saving.
+        g = gasleft();
+        parseBurnOpReturn(parsedTx.outputs[0].script);
+        record("_parseBurnOpReturn (replica)", g - gasleft());
+    }
+
+    /// @dev Mirrors BridgeLock._parseBurnOpReturn's reads. Field checks are omitted --
+    /// they are comparisons on already-extracted values and cost nothing next to the
+    /// reads -- so this is a floor on that function rather than an exact figure.
+    function parseBurnOpReturn(bytes memory script) private pure {
+        uint256 offset = 1;
+        bytes memory field;
+        for (uint256 i = 0; i < 8; i++) {
+            (field, offset) = EcashTx.readPush(script, offset);
+        }
+    }
+
+    /// @dev What the two consumed-outpoint mappings cost, measured rather than quoted.
+    ///
+    /// Storage dominates confirmDeposit and is a third of what is left in release(),
+    /// and the yellow paper's numbers are easy to misapply -- a cold slot read before
+    /// a write changes what the write itself costs. Writing real slots settles it.
+    mapping(bytes32 => bytes32) private consumed;
+
+    struct Auth {
+        bytes32 utxoTxid;
+        uint32 utxoIndex;
+        uint8 v;
+        bytes32 r;
+        bytes32 s;
+    }
+
+    mapping(bytes32 => Auth) private auths;
+
+    function profileStorage(bytes32 key) external {
+        delete steps;
+        uint256 g;
+
+        // The release() shape: read the slot to check it is unset, then write it.
+        g = gasleft();
+        bool unset = consumed[key] == bytes32(0);
+        record("SLOAD (cold, consumed-outpoint check)", g - gasleft());
+
+        g = gasleft();
+        if (unset) consumed[key] = key;
+        record("SSTORE (warm, zero to non-zero)", g - gasleft());
+
+        // The confirmDeposit shape: a five-field authorization struct, which packs
+        // into four slots and is the single largest thing that function does.
+        g = gasleft();
+        auths[key] = Auth({utxoTxid: key, utxoIndex: 1, v: 27, r: key, s: key});
+        record("SSTORE x4 (authorization struct)", g - gasleft());
     }
 }
