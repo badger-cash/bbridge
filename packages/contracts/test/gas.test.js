@@ -26,11 +26,12 @@ const { bitsToTarget, mineSingleTxHeader, EASY_BITS } = require('./helpers/ecash
  */
 
 /**
- * Observed 275,230 worst case, down from 448,039 once the byte-at-a-time readers were
- * replaced with word reads. Tightened each time rather than left where it was: a
- * ceiling far above the real figure quietly absorbs the regression it exists to catch.
+ * Observed 248,497 worst case, down from 448,039 once the byte-at-a-time readers and
+ * the per-field allocations were removed. Tightened each time rather than left where
+ * it was: a ceiling far above the real figure quietly absorbs the regression it exists
+ * to catch.
  */
-const RELEASE_CEILING = 310_000
+const RELEASE_CEILING = 280_000
 
 /** Observed 186,004. Paid by the Authorizer's gas key, once per deposit. */
 const CONFIRM_DEPOSIT_CEILING = 220_000
