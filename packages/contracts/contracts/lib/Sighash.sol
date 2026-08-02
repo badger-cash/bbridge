@@ -79,18 +79,37 @@ library Sighash {
         }
     }
 
-    function leU32(uint32 value) internal pure returns (bytes memory result) {
-        result = new bytes(4);
-        for (uint256 i = 0; i < 4; i++) {
-            result[i] = bytes1(uint8(value >> (8 * i)));
-        }
+    /*
+     * Fixed-width value types rather than `bytes memory`.
+     *
+     * These are called about a dozen times per digest -- once per input for the
+     * prevout index and the sequence, once per output for the value, and five more in
+     * the preimage itself. Returning `bytes memory` meant each call allocated a small
+     * array, filled it a byte at a time with a bounds check per byte, and was then
+     * copied a second time by the `abi.encodePacked` that consumed it.
+     *
+     * `abi.encodePacked` writes a `bytesN` inline, so returning `bytes4`/`bytes8`
+     * removes both the allocation and the copy while producing identical bytes.
+     */
+
+    /// @dev uint32 to its little-endian 4 bytes: 0xAABBCCDD becomes DD CC BB AA.
+    function leU32(uint32 value) internal pure returns (bytes4) {
+        return bytes4(
+            (value << 24) |
+            ((value & 0x0000ff00) << 8) |
+            ((value >> 8) & 0x0000ff00) |
+            (value >> 24)
+        );
     }
 
-    function leU64(uint64 value) internal pure returns (bytes memory result) {
-        result = new bytes(8);
-        for (uint256 i = 0; i < 8; i++) {
-            result[i] = bytes1(uint8(value >> (8 * i)));
-        }
+    /// @dev uint64 to its little-endian 8 bytes, by the standard pairwise byte swap:
+    /// exchange adjacent bytes, then adjacent pairs, then the two halves.
+    function leU64(uint64 value) internal pure returns (bytes8) {
+        uint64 v = value;
+        v = ((v & 0x00ff00ff00ff00ff) << 8) | ((v >> 8) & 0x00ff00ff00ff00ff);
+        v = ((v & 0x0000ffff0000ffff) << 16) | ((v >> 16) & 0x0000ffff0000ffff);
+        v = (v << 32) | (v >> 32);
+        return bytes8(v);
     }
 
     /// @dev Bitcoin-style CompactSize varint encoding.

@@ -94,8 +94,8 @@ The point of this handshake is purely to give the Authorizer's own monitoring an
 3. `require(utxoConsumedBy[keccak256(utxoTxid, utxoIndex)] == bytes32(0))` — the vault outpoint can back at most one confirmation, ever, regardless of which `depositId` (§2.3 fix).
 4. Compute the message (see below), then `digest = sha256(abi.encodePacked(sha256(message)))` — double-SHA256, matching what the eCash-side covenant's `OP_CHECKDATASIGVERIFY` actually checks against (confirmed against `bcash`'s script source while designing the SDK's covenant; eCash's single-hash `OP_CHECKDATASIG` semantics plus the covenant's own extra `OP_SHA256` step compose to a full `HASH256`).
 5. `require(ecrecover(digest, v, r, s) == authorizer)`.
-6. Mark confirmed, set `utxoConsumedBy[keccak256(utxoTxid, utxoIndex)] = depositId`, store `{utxoTxid, utxoIndex, v, r, s}` for `getAuthorization` to return.
-7. Emit `DepositConfirmed(depositId, utxoTxid, utxoIndex)`.
+6. Mark confirmed, set `utxoConsumedBy[keccak256(utxoTxid, utxoIndex)] = depositId`.
+7. Emit `DepositConfirmed(depositId, utxoTxid, utxoIndex, v, r, s)` — the publication channel for the signature and the outpoint it is bound to (`docs/SPEC.md` §III.5).
 
 **Message (content) definition**, following the SLP self-mint protocol's Token Type 2 authorization format (§2.4):
 
@@ -114,9 +114,11 @@ where `txOutputs` is the fully serialized MINT OP_RETURN output plus the `SLP_DU
 
 `utxoTxid`/`utxoIndex` together are a real eCash outpoint (internal byte order for the txid, matching how `EcashTx.sol` already handles prevout hashes elsewhere in this contract, and little-endian for the index, matching a BIP143 preimage's own embedded outpoint field byte-for-byte) — chosen specifically so the covenant can `equalverify` this against its own spend's outpoint with zero byte-order conversion in script.
 
-### `getAuthorization(bytes32 depositId) external view returns (bool confirmed, bytes20 xecRecipient, uint64 xecAmount, bytes32 utxoTxid, uint32 utxoIndex, uint8 v, bytes32 r, bytes32 s)`
+### `getAuthorization(bytes32 depositId) external view returns (bool confirmed, bytes20 xecRecipient, uint64 xecAmount)`
 
-Public, unauthenticated, callable by anyone — this is what makes the authorization "not delivered by, or negotiated with, the Authorizer" (no-action-letter draft §1.2). No party is favored by early or exclusive access to this data.
+Public, unauthenticated, callable by anyone — this, together with the `DepositConfirmed` log, is what makes the authorization "not delivered by, or negotiated with, the Authorizer" (no-action-letter draft §1.2). No party is favored by early or exclusive access to either.
+
+This function returns what is derivable from stored state; the signature and the vault outpoint are published in the log. They are not stored because nothing reads them from storage: the signature's only consumer is the eCash covenant, which verifies it against `message` directly and cannot see Ethereum, so a bad authorization fails there rather than at a lookup here. Four storage slots per deposit — about 88,800 gas, over half of `confirmDeposit`'s total — bought a record the protocol never consults.
 
 **Note on `confirmDeposit`'s security model (§2.5):** the signature verified in step 5 above is unconditionally valid the moment it exists, regardless of whether this call itself ever succeeds — a property of ECDSA, not something this contract's logic can change. The only thing standing between that fact and the confirm/refund race described in §2.5 is the Authorizer never letting the referenced vault UTXO become spendable on XEC before this call has actually reached finality on Ethereum (vault UTXO quarantine, `docs/SPEC.md` §III.7). This contract has no way to check or enforce that; it's documented here as a load-bearing assumption, not an oversight. The `requestRefund()`/`refundDelay` handshake above narrows the practical window for that race by giving the Authorizer's monitor advance warning, but it's a best-effort mitigation contingent on that monitor actually watching and reacting — it does not make an already-broadcast, already-extracted signature harmless the way quarantine does, and should not be mistaken for a substitute for it.
 

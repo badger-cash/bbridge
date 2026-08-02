@@ -55,8 +55,11 @@ library Difficulty {
     /// same way).
     function headerMerkleRoot(bytes calldata rawHeader) internal pure returns (bytes32 result) {
         require(rawHeader.length == 80, "header must be 80 bytes");
-        for (uint256 i = 0; i < 32; i++) {
-            result |= bytes32(uint256(uint8(rawHeader[36 + i]))) << (8 * (31 - i));
+        // Straight big-endian 32 bytes at a fixed offset, which is one calldataload.
+        // The length check above is what makes the read in-bounds; calldataload past
+        // the end would pad with zeros rather than revert.
+        assembly ("memory-safe") {
+            result := calldataload(add(rawHeader.offset, 36))
         }
     }
 
