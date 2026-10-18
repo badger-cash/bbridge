@@ -50,6 +50,8 @@ declare module '@hansekontor/checkout-components' {
     readonly code: Array<{ data?: Buffer; value: number }>
 
     pushSym(sym: string): this
+    /** Append an opcode as given, without minimal-push encoding. */
+    push(op: Opcode): this
     pushData(data: Buffer): this
     pushPush(data: Buffer): this
     pushInt(n: number): this
@@ -68,6 +70,12 @@ declare module '@hansekontor/checkout-components' {
     getSym(index: number): string
     getData(index: number): Buffer
     getInt(index: number): number
+  }
+
+  export class Opcode {
+    constructor(value: number, data?: Buffer | null)
+    value: number
+    data: Buffer | null
   }
 
   export class Output {

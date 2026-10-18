@@ -1,4 +1,4 @@
-import { Address, Script, Output, KeyRing, bcrypto } from '@hansekontor/checkout-components'
+import { Address, Script, Opcode, Output, KeyRing, bcrypto } from '@hansekontor/checkout-components'
 import * as bio from 'bufio'
 import assert from 'bsert'
 import { U64 } from 'n64'
@@ -125,7 +125,20 @@ export function buildMintOpReturnV2(tokenId: Buffer, mintQuantityArr: number[]):
 }
 
 /**
- * Build SLP token type 2 GENESIS OP_RETURN.
+ * Push one SLP message field. The SLP specification requires an empty field
+ * to be pushed as OP_PUSHDATA1 0x00 (4c00); pushData would compile an empty
+ * buffer to OP_0, which is not valid SLP, and bcash's parser rejects a
+ * GENESIS whose document hash is OP_0.
+ */
+function pushSlpField(script: Script, data: Buffer): Script {
+  if (data.length === 0)
+    return script.push(new Opcode(0x4c, Buffer.alloc(0)))
+  return script.pushData(data)
+}
+
+/**
+ * Build SLP token type 2 GENESIS OP_RETURN. Empty ticker, name, url or
+ * document hash fields are pushed as the specification requires (4c00).
  */
 export function buildGenesisOpReturnV2(
   tokenTicker: string,
@@ -141,10 +154,11 @@ export function buildGenesisOpReturnV2(
     .pushData(Buffer.concat([Buffer.from('SLP', 'ascii'), Buffer.alloc(1)]))
     .pushPush(Buffer.alloc(1, 2))
     .pushData(Buffer.from('GENESIS', 'ascii'))
-    .pushData(Buffer.from(tokenTicker, 'ascii'))
-    .pushData(Buffer.from(tokenName, 'ascii'))
-    .pushData(Buffer.from(tokenUrl, 'ascii'))
-    .pushData(tokenDocHash)
+  pushSlpField(genesisOpReturn, Buffer.from(tokenTicker, 'ascii'))
+  pushSlpField(genesisOpReturn, Buffer.from(tokenName, 'ascii'))
+  pushSlpField(genesisOpReturn, Buffer.from(tokenUrl, 'ascii'))
+  pushSlpField(genesisOpReturn, tokenDocHash)
+  genesisOpReturn
     .pushPush(Buffer.alloc(1, decimals))
     .pushData(mintVaultScripthash)
     .pushData(U64.fromString(String(genesisQuantity)).toBE(Buffer)) // fromString, not fromInt -- see buildOutOracle's note above
