@@ -111,6 +111,48 @@ test('buildGenesisOpReturnV2 encodes an SLP type-2 GENESIS message', () => {
   assert.deepEqual(script.getData(9), vaultHash)
 })
 
+test('buildGenesisOpReturnV2 pushes empty fields as OP_PUSHDATA1 0x00, as SLP requires', () => {
+  const vaultHash = Buffer.alloc(20, 0x22)
+  const script = buildGenesisOpReturnV2('', '', '', Buffer.alloc(0), 2, 0, vaultHash)
+  const raw = script.toRaw().toString('hex')
+
+  // OP_RETURN, lokad, version, 'GENESIS', then four empty fields: 4c00 each
+  assert.ok(raw.startsWith('6a04534c500001020747454e45534953' + '4c00'.repeat(4)), raw)
+  assert.ok(script.code.slice(1).every((op: { value: number }) => op.value !== 0), 'no OP_0 after OP_RETURN')
+  for (let i = 4; i <= 7; i++)
+    assert.equal(script.getData(i).length, 0, `field ${i}`)
+})
+
+test('buildGenesisOpReturnV2 output is accepted by the SLP parser with an empty document hash', () => {
+  const { script: { SLP } } = require('@hansekontor/checkout-components')
+  const vaultHash = Buffer.alloc(20, 0x22)
+  const slp = SLP.fromScript(buildGenesisOpReturnV2('TCK', 'Test Token', '', Buffer.alloc(0), 6, 1000, vaultHash))
+
+  assert.equal(slp.isValidSlp(), true)
+  assert.equal(slp.getType(), 'GENESIS')
+  assert.deepEqual(slp.getData(9), vaultHash)
+})
+
+test('buildGenesisOpReturnV2 encodes non-empty fields exactly as before', () => {
+  const vaultHash = Buffer.alloc(20, 0x22)
+  const script = buildGenesisOpReturnV2('TCK', 'Test Token', 'https://example.com', Buffer.alloc(32, 7), 6, 5, vaultHash)
+  const expected = new Script()
+    .pushSym('return')
+    .pushData(Buffer.from('534c5000', 'hex'))
+    .pushPush(Buffer.alloc(1, 2))
+    .pushData(Buffer.from('GENESIS', 'ascii'))
+    .pushData(Buffer.from('TCK', 'ascii'))
+    .pushData(Buffer.from('Test Token', 'ascii'))
+    .pushData(Buffer.from('https://example.com', 'ascii'))
+    .pushData(Buffer.alloc(32, 7))
+    .pushPush(Buffer.alloc(1, 6))
+    .pushData(vaultHash)
+    .pushData(Buffer.from('0000000000000005', 'hex'))
+    .compile()
+
+  assert.equal(script.toRaw().toString('hex'), expected.toRaw().toString('hex'))
+})
+
 test('mintOutscript is deterministic and varies with its parameters', () => {
   const pubkeyA = KeyRing.generate().getPublicKey()
   const pubkeyB = KeyRing.generate().getPublicKey()
