@@ -117,9 +117,14 @@ contract BridgeLock is ReentrancyGuard {
     /// deployer-supplied constant like the rest of section `3.`).
     uint8 public immutable tokenDecimals;
 
-    /// @dev The wrapped SLP token's identity -- HASH256 of the raw GENESIS
+    /// @dev The wrapped SLP token's identity -- the txid of the raw GENESIS
     /// transaction supplied to the constructor (`rawGenesisTx_`), which by SLP
-    /// convention *is* that token's token_id. Unlike xecDecimals, this needs no
+    /// convention *is* that token's token_id. SLP pushes token_id in the txid's
+    /// display byte order: HASH256 of the GENESIS, byte-reversed. Indexers
+    /// (Chronik, bcash's SLP indexer) look a MINT's or BURN's token_id up that
+    /// way, so this is stored reversed too; un-reversed, every mint this contract
+    /// authorizes would name a token that does not exist, and release() would
+    /// reject every real burn. Unlike xecDecimals, this needs no
     /// separate trust: it's not a declared value, it's the deterministic hash of
     /// bytes the deployer already has to get exactly right anyway (the same bytes
     /// they broadcast as the real GENESIS transaction on XEC), so deriving it here
@@ -359,7 +364,7 @@ contract BridgeLock is ReentrancyGuard {
         refundDelay = refundDelay_;
         chainId = block.chainid;
 
-        xecTokenId = sha256(abi.encodePacked(sha256(rawGenesisTx_)));
+        xecTokenId = _reverseBytes32(sha256(abi.encodePacked(sha256(rawGenesisTx_))));
 
         bytes memory genesisScript = _firstOutputScript(rawGenesisTx_);
         (
@@ -767,6 +772,20 @@ contract BridgeLock is ReentrancyGuard {
     /// test/BridgeLock.test.js against known values. Takes a uint64 directly -- the
     /// caller (confirmDeposit) has already bounds-checked the value fits, so this is
     /// no longer a narrowing cast.
+    /// @dev A 32-byte hash in the other byte order: internal <-> display.
+    function _reverseBytes32(bytes32 value) internal pure returns (bytes32) {
+        uint256 v = uint256(value);
+        v = ((v >> 8) & 0x00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF)
+            | ((v & 0x00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF00FF) << 8);
+        v = ((v >> 16) & 0x0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF)
+            | ((v & 0x0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF0000FFFF) << 16);
+        v = ((v >> 32) & 0x00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF)
+            | ((v & 0x00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF00000000FFFFFFFF) << 32);
+        v = ((v >> 64) & 0x0000000000000000FFFFFFFFFFFFFFFF0000000000000000FFFFFFFFFFFFFFFF)
+            | ((v & 0x0000000000000000FFFFFFFFFFFFFFFF0000000000000000FFFFFFFFFFFFFFFF) << 64);
+        return bytes32((v >> 128) | (v << 128));
+    }
+
     function _toBE8(uint64 amount) internal pure returns (bytes8) {
         return bytes8(amount);
     }
@@ -1020,7 +1039,7 @@ contract BridgeLock is ReentrancyGuard {
     /// hand-typed stored constant, which added complexity and gas for a check that
     /// couldn't provide real security beyond what the Authorizer's cosign already
     /// guarantees (a hand-typed constant is just as much an unverified trust point as
-    /// anything else). `xecTokenId` is different: it's HASH256 of the actual
+    /// anything else). `xecTokenId` is different: it's the txid of the actual
     /// `rawGenesisTx_` given to the constructor, not a separately-asserted value, so
     /// this check now holds independently of Authorizer honesty (see xecTokenId's own
     /// doc comment).

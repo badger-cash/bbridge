@@ -304,7 +304,7 @@ message = depositId (32) || utxoTxid (32) || utxoIndex (4, LE) || txOutputs
 | 4 | 32 | `token_id` (the wrapped token's own, `xecTokenId` below) |
 | 5 | 8 | Mint quantity, big-endian |
 
-`token_id` here is the Ethereum Lock Contract's own `xecTokenId` — the HASH256 of the raw GENESIS transaction bytes supplied at construction (Section II) — not a separately hand-typed value, so this field cannot independently drift from the token the contract was actually deployed against.
+`token_id` here is the Ethereum Lock Contract's own `xecTokenId` — the txid of the raw GENESIS transaction bytes supplied at construction (Section II), in display byte order: their HASH256, byte-reversed, which is how SLP pushes `token_id` and how indexers look it up — not a separately hand-typed value, so this field cannot independently drift from the token the contract was actually deployed against.
 
 ### BURN OP_RETURN
 
@@ -321,7 +321,7 @@ A bridge-specific variant of the standard SLP Type 2 BURN format:
 | 7 | 20 | `recipientHash160` |
 | 8 | 32 | `chainId`, big-endian |
 
-`token_id` (push 4) *is* verified against `xecTokenId` (`WrongTokenId` if it doesn't match) — but `xecTokenId` is not a separately hand-typed constant the way an earlier draft of this contract used. It is derived, once, at construction, as the HASH256 of the raw GENESIS transaction bytes the deployer supplies (Section II) — by SLP convention, a token's `token_id` *is* the HASH256 of its own GENESIS transaction, so this value cannot independently drift from the token actually deployed on XEC the way a hand-typed constant could. This is a narrower guarantee than full SLP validity: it does not trace token lineage back through the transaction graph the way a real indexer would, and it doesn't need to — the Authorizer's decision to co-sign the postage input (Section IV.2) remains the operative attestation that a burn represents the *correct* wrapped token in the presumably-indexed sense; this check only additionally rules out a mismatch against what this specific deployment was actually genesis'd with.
+`token_id` (push 4) *is* verified against `xecTokenId` (`WrongTokenId` if it doesn't match) — but `xecTokenId` is not a separately hand-typed constant the way an earlier draft of this contract used. It is derived, once, at construction, as the txid of the raw GENESIS transaction bytes the deployer supplies (Section II), in display byte order (HASH256, byte-reversed) — by SLP convention, a token's `token_id` *is* the txid of its own GENESIS transaction, pushed in that order, so this value cannot independently drift from the token actually deployed on XEC the way a hand-typed constant could. This is a narrower guarantee than full SLP validity: it does not trace token lineage back through the transaction graph the way a real indexer would, and it doesn't need to — the Authorizer's decision to co-sign the postage input (Section IV.2) remains the operative attestation that a burn represents the *correct* wrapped token in the presumably-indexed sense; this check only additionally rules out a mismatch against what this specific deployment was actually genesis'd with.
 
 `assetId` (push 6) *is* independently verified (Section IV.3.2), against the releasing contract's own address. This is a distinct kind of check from `token_id`: a trivial, self-referential domain separator requiring no external data or trust, present to scope a burn to the correct bridge deployment even under a fully honest Authorizer (for example, one Authorizer key backing multiple deployments).
 

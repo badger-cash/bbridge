@@ -303,7 +303,7 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
     expect(await bridge.xecTokenId()).to.equal(xecTokenId)
   })
 
-  it('derives xecTokenId as HASH256 of the exact raw genesis tx bytes given to the constructor', async function () {
+  it('derives xecTokenId as the txid, in display order, of the exact raw genesis tx bytes given to the constructor', async function () {
     const [depositor] = await ethers.getSigners()
     const authorizerWallet = ethers.Wallet.createRandom()
 
@@ -312,7 +312,8 @@ describe('BridgeLock decimal scaling (Findings #2 and #4)', function () {
     await token.deployed()
 
     const rawGenesisTx = buildRawGenesisTx(buildGenesisOpReturn({ decimals: 9, ticker: 'XUSD', name: 'Wrapped USD' }))
-    const expectedTokenId = '0x' + genesisHash256(rawGenesisTx).toString('hex')
+    // HASH256 byte-reversed: the txid as displayed, which is how SLP pushes token_id
+    const expectedTokenId = '0x' + Buffer.from(genesisHash256(rawGenesisTx)).reverse().toString('hex')
 
     const Bridge = await ethers.getContractFactory('BridgeLock')
     const bridge = await Bridge.deploy(

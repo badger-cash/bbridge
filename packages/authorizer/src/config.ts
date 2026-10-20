@@ -13,7 +13,7 @@ export interface AuthorizerConfig {
   lockContractAddress: string
   /** The contract's own immutable chainId (block.chainid at construction). */
   chainId: bigint
-  /** The wrapped token's token_id: HASH256 of its GENESIS transaction, 32 bytes. */
+  /** The wrapped token's token_id: its GENESIS txid in display order (HASH256 byte-reversed), as SLP pushes it. 32 bytes. */
   xecTokenId: Buffer
   /** Decimals of the wrapped XEC-side token, parsed from its GENESIS. */
   xecDecimals: number
