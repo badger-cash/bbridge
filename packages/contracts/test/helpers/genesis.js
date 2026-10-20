@@ -83,7 +83,8 @@ function buildRawGenesisTx(opReturnScript) {
 // in one call -- what nearly every test site actually wants.
 function buildGenesis(opts = {}) {
   const rawTx = buildRawGenesisTx(buildGenesisOpReturn(opts))
-  const tokenId = '0x' + hash256(rawTx).toString('hex')
+  // The txid in display order, as SLP pushes token_id: HASH256 byte-reversed.
+  const tokenId = '0x' + Buffer.from(hash256(rawTx)).reverse().toString('hex')
   return { rawTx: '0x' + rawTx.toString('hex'), tokenId }
 }
 
